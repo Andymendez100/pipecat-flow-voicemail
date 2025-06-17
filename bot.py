@@ -21,6 +21,7 @@ from pipecat.frames.frames import (
     EndTaskFrame,
     InputAudioRawFrame,
     StopTaskFrame,
+    TextFrame,
     TranscriptionFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
@@ -274,13 +275,11 @@ class FunctionHandlers:
 
     async def voicemail_response(self, params: FunctionCallParams):
         """Function the bot can call to leave a voicemail message."""
-        message = "Say this message exactly: 'Hello, this is a message for Pipecat example user. This is Chatbot. Please call back on 123-456-7891. Thank you.' Then call the terminate_call function."
+        message = "Say this message exactly: 'Hello, this is a message for Pipecat example user. This is Chatbot. Please call back on 123-456-7891. Thank you.' After saying this message, immediately call the terminate_call function."
 
-        # Update state to indicate voicemail was detected and call should be terminated
+        # Update state to indicate voicemail was detected
         self.call_flow_state.set_voicemail_detected()
-        self.call_flow_state.set_call_terminated()
 
-        # Send the message - let the LLM speak it and then call terminate_call
         await params.result_callback(message)
 
     async def human_conversation(self, params: FunctionCallParams):
@@ -581,8 +580,10 @@ async def run_bot(
         BE DECISIVE: If you hear "Hello?" or "Hello? Is anyone there?" - this is clearly a HUMAN, call switch_to_human_conversation IMMEDIATELY.
 
         DO NOT say anything until you've determined if this is a voicemail or human.
+        
+        When you detect a voicemail system, call switch_to_voicemail_response and then FOLLOW THE EXACT INSTRUCTIONS it provides, including calling terminate_call when instructed.
 
-        If you are asked to terminate the call, **IMMEDIATELY** call the `terminate_call` function."""
+        Only call the terminate_call function when explicitly instructed to do so by a function response or if there's an error."""
 
     # Initialize voicemail detection LLM
     voicemail_detection_llm = GoogleLLMService(
