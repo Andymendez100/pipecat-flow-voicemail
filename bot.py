@@ -46,6 +46,7 @@ from pipecat.transports.services.daily import (
 
 from pipecat_flows import FlowArgs, FlowManager, FlowResult, FlowsFunctionSchema, NodeConfig
 from script_pages.page5 import create_page_5_entry_node
+from utils.hold_music_manager import HoldMusicManager
 load_dotenv(override=True)
 
 logger.remove(0)
@@ -131,70 +132,26 @@ async def create_room_and_tokens(api_key: str, env: str = "prod") -> tuple[str, 
             bot_token = bot_token_data["token"]
             logger.info("Created bot token")
 
-    return room_url, bot_token
-
-
-async def create_room_and_bot_token(api_key: str, api_url: str = "https://api.daily.co/v1") -> tuple[str, str]:
-    """Create a Daily room and generate bot token.
-
-    Args:
-        api_key: Daily API key
-        api_url: Daily API URL (defaults to production)
-
-    Returns:
-        Tuple of (room_url, bot_token)
-    """
-    if not api_key:
-        raise ValueError("Daily API key is required")
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-
-    async with aiohttp.ClientSession() as session:
-        # Create room
-        room_config = {
-            "properties": {
-                "enable_chat": False,
-                "enable_knocking": False,
-                "enable_prejoin_ui": False,
-                "enable_screenshare": False,
-                "start_video_off": True,
-                "start_audio_off": False,
-                "max_participants": 2
-            }
-        }
-
-        async with session.post(f"{api_url}/rooms", headers=headers, json=room_config) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                raise Exception(
-                    f"Failed to create room: {response.status} - {error_text}")
-
-            room_data = await response.json()
-            room_url = room_data["url"]
-            logger.info(f"Created room: {room_url}")
-
-        # Create bot token
-        bot_token_config = {
+        # Create music token
+        music_token_config = {
             "properties": {
                 "room_name": room_data["name"],
-                "user_name": "Voicemail Bot"
+                "user_name": "hold-music",
+                "user_id": "hold-music",
             }
         }
 
-        async with session.post(f"{api_url}/meeting-tokens", headers=headers, json=bot_token_config) as response:
+        async with session.post(f"{api_url}/meeting-tokens", headers=headers, json=music_token_config) as response:
             if response.status != 200:
                 error_text = await response.text()
                 raise Exception(
-                    f"Failed to create bot token: {response.status} - {error_text}")
+                    f"Failed to create music token: {response.status} - {error_text}")
 
-            bot_token_data = await response.json()
-            bot_token = bot_token_data["token"]
-            logger.info("Created bot token")
+            music_token_data = await response.json()
+            music_token = music_token_data["token"]
+            logger.info("Created music token")
 
-    return room_url, bot_token
+    return room_url, bot_token, music_token
 
 
 # ------------ HELPER CLASSES ------------
@@ -465,6 +422,7 @@ async def run_bot(
     room_url: str,
     token: str,
     body: dict,
+    music_token: str = None,
 ) -> None:
     """Run the voice bot with the given parameters.
 
@@ -472,6 +430,7 @@ async def run_bot(
         room_url: The Daily room URL
         token: The Daily room token
         body: Body passed to the bot from the webhook
+        music_token: The Daily music token (optional)
 
     """
     # ------------ CONFIGURATION AND SETUP ------------
@@ -510,24 +469,17 @@ async def run_bot(
 
     # ------------ TRANSPORT SETUP ------------
 
-    transport_params = DailyParams(
-        api_url=daily_api_url,
-        api_key=daily_api_key,
-        audio_in_enabled=True,
-        audio_out_enabled=True,
-        video_out_enabled=False,
-        vad_analyzer=SileroVADAnalyzer(),
-        transcription_enabled=True,
-    )
-
-    # Initialize transport with Daily
     transport = DailyTransport(
-        room_url,
-        token,
-        "Voicemail Detection Bot",
-        transport_params,
-    )
+        room_url=room_url,
+        token=token,
+        bot_name=f"CA_Aged Bot",
+        params=DailyParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            vad_analyzer=SileroVADAnalyzer()
+        )
 
+    )
     # Initialize TTS with optimized settings for clarity
     tts = CartesiaTTSService(
         api_key=os.getenv("CARTESIA_API_KEY", ""),
@@ -836,6 +788,19 @@ async def run_bot(
     logger.debug(
         f"Stored partner phone number in flow_manager.state: {partner_phone_number}")
 
+    # Store the music token in flow_manager.state
+    flow_manager.state["music_token"] = music_token
+    logger.debug(
+        f"Stored music token in flow_manager.state: {music_token[:10]}...")
+
+    # Store the room URL in flow_manager.state
+    flow_manager.state["daily_room_url"] = room_url
+    logger.debug(f"Stored room URL in flow_manager.state: {room_url}")
+
+    # Store the hold music manager in flow_manager.state
+    flow_manager.state["hold_music_manager"] = HoldMusicManager()
+    logger.debug("Stored hold music manager in flow_manager.state")
+
     # Update participant left handler for human conversation phase
     @transport.event_handler("on_participant_left")
     async def on_participant_left(transport, participant, reason):
@@ -1064,8 +1029,8 @@ async def main():
         sys.exit(1)
 
     try:
-        # Create room and token
-        room_url, bot_token = await create_room_and_tokens(daily_api_key, daily_api_url)
+        # Create room and tokens
+        room_url, bot_token, music_token = await create_room_and_tokens(daily_api_key, daily_api_url)
 
         # Create body configuration for dial-out
         dialout_settings = {
@@ -1079,10 +1044,11 @@ async def main():
         body_json = json.dumps(body_config)
 
         logger.info(f"Created room: {room_url}")
+        logger.info(f"Created music token: {music_token[:10]}...")
         logger.info(f"Calling phone number: {phone_number}")
 
         # Run the bot
-        await run_bot(room_url, bot_token, body_json)
+        await run_bot(room_url, bot_token, body_json, music_token)
 
     except Exception as e:
         logger.error(f"Failed to create room and run bot: {e}")
