@@ -286,6 +286,12 @@ class FunctionHandlers:
         """Function called when bot detects it's talking to a human."""
         # Update state to indicate human was detected
         self.call_flow_state.set_human_detected()
+
+        # Send a brief acknowledgment before switching pipelines
+        message = "Hello there! I hear you. How can I help you today?"
+        await params.result_callback(message)
+
+        # Stop the current pipeline after the response
         await params.llm.push_frame(StopTaskFrame(), FrameDirection.UPSTREAM)
 
 
@@ -364,8 +370,10 @@ def create_greeting_node() -> NodeConfig:
             {
                 "role": "system",
                 "content": (
-                    "Greet the human warmly and ask how you can help them today. "
-                    "After greeting them, call handle_greeting to proceed to the conversation."
+                    "The user has been detected as a human (not a voicemail system). "
+                    "Respond naturally to what they say. Listen to their input and respond appropriately. "
+                    "If they seem to be greeting you or asking if someone is there, greet them warmly. "
+                    "After responding to their input, call handle_greeting to proceed to the main conversation."
                 ),
             }
         ],
@@ -736,6 +744,9 @@ async def run_bot(
 
     # ------------ HUMAN CONVERSATION PHASE SETUP (FLOWS-BASED) ------------
 
+    # Add a small delay to ensure the voicemail detection pipeline has fully stopped
+    await asyncio.sleep(0.5)
+
     print("!!! starting human conversation pipeline with flows")
 
     # Initialize human conversation LLM for flows
@@ -749,6 +760,11 @@ async def run_bot(
     human_conversation_context_aggregator = human_conversation_llm.create_context_aggregator(
         human_conversation_context
     )
+
+    # Clear any lingering transcription state in the transport
+    # This prevents old audio/transcription from interfering with the new pipeline
+    await transport.stop_transcription()
+    await transport.start_transcription()
 
     # Build human conversation pipeline for flows
     human_conversation_pipeline = Pipeline(
@@ -784,12 +800,17 @@ async def run_bot(
 
     # ------------ RUN HUMAN CONVERSATION PIPELINE WITH FLOWS ------------
 
-    # Run the human conversation pipeline first, then set up flows
     try:
-        # Just start the pipeline without flows for now to test
+        # Initialize the flow manager first
+        await flow_manager.initialize()
+
+        # Set the initial node
+        await flow_manager.set_node("greeting", create_greeting_node())
+
+        # Run the human conversation pipeline with flows
         await runner.run(human_conversation_pipeline_task)
     except Exception as e:
-        logger.error(f"Error in voicemail detection pipeline: {e}")
+        logger.error(f"Error in human conversation pipeline: {e}")
         import traceback
 
         logger.error(traceback.format_exc())
