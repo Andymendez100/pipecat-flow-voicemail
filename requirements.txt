@@ -1,0 +1,3 @@
+python-dotenv
+pipecat-ai[cartesia,daily,openai,silero,google]
+pipecat-ai-flows
