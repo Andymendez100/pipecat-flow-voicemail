@@ -155,32 +155,73 @@ async def start_warm_transfer(action: dict, flow_manager: FlowManager):
     """
     logger.info("PAGE 5 HANDLER: Initiating warm transfer...")
 
-    transport: DailyTransport = flow_manager.transport
-
-    # Start the partner dialout
+    # Use Daily API directly instead of transport.start_dialout()
+    # since the transport is already being used for the consumer call
     try:
-        partner_phone_number = flow_manager.state.get(
-            'partner_phone_number')
+        partner_phone_number = flow_manager.state.get('partner_phone_number')
+        room_url = flow_manager.state.get('daily_room_url')
+        music_token = flow_manager.state.get('music_token')
+
+        if not partner_phone_number:
+            raise ValueError("Partner phone number not found in state")
+        if not room_url:
+            raise ValueError("Room URL not found in state")
+        if not music_token:
+            raise ValueError("Music token not found in state")
+
         logger.info(
             f"PAGE 5 HANDLER: Starting partner dialout to {partner_phone_number}")
-        await transport.start_dialout({
-            "phoneNumber": "+19519887911",
+
+        # Use the music token to join the room and dial the partner
+        # This creates a separate connection for the partner dialout
+        import aiohttp
+        import os
+
+        daily_api_key = os.getenv("DAILY_API_KEY")
+        daily_api_url = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
+
+        if not daily_api_key:
+            raise ValueError("DAILY_API_KEY not found in environment")
+
+        headers = {
+            "Authorization": f"Bearer {daily_api_key}",
+            "Content-Type": "application/json"
+        }
+
+        # Extract room name from room URL
+        room_name = room_url.split('/')[-1]
+
+        dialout_params = {
+            "phoneNumber": partner_phone_number,
             "displayName": "partner",
             "userId": "partner",
             "permissions": {
                 "canReceive": {
                     "base": False,
-                      "byUserId": {
-                          "bot": True,
-                      }
+                    "byUserId": {
+                        "bot": True,
+                    }
                 }
             }
-        })
-        logger.info("PAGE 5 HANDLER: Partner dialout started successfully")
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{daily_api_url}/rooms/{room_name}/dialOut/start",
+                headers=headers,
+                json=dialout_params
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    raise Exception(
+                        f"Dialout API failed: {response.status} - {error_text}")
+
+                dialout_result = await response.json()
+                logger.info(
+                    f"PAGE 5 HANDLER: Partner dialout started successfully: {dialout_result}")
 
     except Exception as e:
-        logger.error(
-            f"PAGE 5 HANDLER: Failed to start partner dialout: {e}")
+        logger.error(f"PAGE 5 HANDLER: Failed to start partner dialout: {e}")
         return {
             "status": "error",
             "message": "Failed to connect to specialist",

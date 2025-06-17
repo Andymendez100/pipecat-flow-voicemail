@@ -657,9 +657,10 @@ async def run_bot(
 
     @transport.event_handler("on_joined")
     async def on_joined(transport, data):
-        # Start initial dialout attempt
+        # Start initial dialout attempt with a small delay to ensure full initialization
         logger.debug(
             f"Dialout settings detected; starting dialout to number: {phone_number}")
+        await asyncio.sleep(1.0)  # Give the bot time to fully join
         await attempt_dialout()
 
     @transport.event_handler("on_dialout_connected")
