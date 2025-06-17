@@ -1,4 +1,3 @@
-
 #
 # Copyright (c) 2024–2025, Daily
 #
@@ -11,6 +10,7 @@ import json
 import os
 import sys
 from typing import Any
+import aiohttp
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -48,6 +48,139 @@ logger.add(sys.stderr, level="DEBUG")
 
 daily_api_key = os.getenv("DAILY_API_KEY", "")
 daily_api_url = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
+to_phone_number = os.getenv("TO_PHONE_NUMBER", "")
+google_api_key = os.getenv("GOOGLE_API_KEY", "")
+
+
+# ------------ ROOM CREATION FUNCTIONS ------------
+
+
+async def create_room_and_tokens(api_key: str, env: str = "prod") -> tuple[str, str, str]:
+    """Create a Daily room and generate bot and music tokens.
+
+    Args:
+        api_key: Daily API key
+        env: Environment (prod or dev, affects API URL)
+
+    Returns:
+        Tuple of (room_url, bot_token, music_token)
+    """
+    if not api_key:
+        raise ValueError("Daily API key is required")
+
+    # Set API URL based on environment
+    if env == "dev":
+        api_url = "https://api.daily.co/v1"  # You can modify this for dev environment
+    else:
+        api_url = daily_api_url
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    async with aiohttp.ClientSession() as session:
+        # Create room
+        room_config = {
+            "properties": {"max_participants": 3,
+                           "geo": 'us-west-2',
+                           "enable_dialout": True
+                           }
+        }
+
+        async with session.post(f"{api_url}/rooms", headers=headers, json=room_config) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                raise Exception(
+                    f"Failed to create room: {response.status} - {error_text}")
+
+            room_data = await response.json()
+            room_url = room_data["url"]
+            logger.info(f"Created room: {room_url}")
+
+        # Create bot token
+        bot_token_config = {
+            "properties": {
+                "room_name": room_data["name"],
+                "is_owner": True,
+                "user_name": "Voicemail Bot"
+            }
+        }
+
+        async with session.post(f"{api_url}/meeting-tokens", headers=headers, json=bot_token_config) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                raise Exception(
+                    f"Failed to create bot token: {response.status} - {error_text}")
+
+            bot_token_data = await response.json()
+            bot_token = bot_token_data["token"]
+            logger.info("Created bot token")
+
+    return room_url, bot_token
+
+
+async def create_room_and_bot_token(api_key: str, api_url: str = "https://api.daily.co/v1") -> tuple[str, str]:
+    """Create a Daily room and generate bot token.
+
+    Args:
+        api_key: Daily API key
+        api_url: Daily API URL (defaults to production)
+
+    Returns:
+        Tuple of (room_url, bot_token)
+    """
+    if not api_key:
+        raise ValueError("Daily API key is required")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    async with aiohttp.ClientSession() as session:
+        # Create room
+        room_config = {
+            "properties": {
+                "enable_chat": False,
+                "enable_knocking": False,
+                "enable_prejoin_ui": False,
+                "enable_screenshare": False,
+                "start_video_off": True,
+                "start_audio_off": False,
+                "max_participants": 2
+            }
+        }
+
+        async with session.post(f"{api_url}/rooms", headers=headers, json=room_config) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                raise Exception(
+                    f"Failed to create room: {response.status} - {error_text}")
+
+            room_data = await response.json()
+            room_url = room_data["url"]
+            logger.info(f"Created room: {room_url}")
+
+        # Create bot token
+        bot_token_config = {
+            "properties": {
+                "room_name": room_data["name"],
+                "user_name": "Voicemail Bot"
+            }
+        }
+
+        async with session.post(f"{api_url}/meeting-tokens", headers=headers, json=bot_token_config) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                raise Exception(
+                    f"Failed to create bot token: {response.status} - {error_text}")
+
+            bot_token_data = await response.json()
+            bot_token = bot_token_data["token"]
+            logger.info("Created bot token")
+
+    return room_url, bot_token
 
 
 # ------------ HELPER CLASSES ------------
@@ -292,7 +425,7 @@ async def run_bot(
     # Initialize voicemail detection LLM
     voicemail_detection_llm = GoogleLLMService(
         model="models/gemini-2.0-flash-lite",  # Lighter model for faster detection
-        api_key=os.getenv("GOOGLE_API_KEY"),
+        api_key=google_api_key,
         system_instruction=system_instruction,
         tools=tools,
     )
@@ -458,7 +591,7 @@ async def run_bot(
     # Initialize human conversation LLM
     human_conversation_llm = GoogleLLMService(
         model="models/gemini-2.0-flash-001",  # Full model for better conversation
-        api_key=os.getenv("GOOGLE_API_KEY"),
+        api_key=google_api_key,
         system_instruction=human_conversation_system_instruction,
         tools=tools,
     )
@@ -536,23 +669,89 @@ async def run_bot(
 
 async def main():
     """Parse command line arguments and run the bot."""
-    parser = argparse.ArgumentParser(description="Simple Dial-out Bot")
-    parser.add_argument("-u", "--url", type=str, help="Room URL")
-    parser.add_argument("-t", "--token", type=str, help="Room Token")
+    parser = argparse.ArgumentParser(description="Voicemail Detection Bot")
+    parser.add_argument("-u", "--url", type=str,
+                        help="Room URL (webhook mode)")
+    parser.add_argument("-t", "--token", type=str,
+                        help="Room Token (webhook mode)")
     parser.add_argument("-b", "--body", type=str,
-                        help="JSON configuration string")
+                        help="JSON configuration string (webhook mode)")
+    parser.add_argument("-p", "--phone", type=str,
+                        help="Phone number to call (overrides TO_PHONE_NUMBER env var)")
+    parser.add_argument("-c", "--caller-id", type=str,
+                        help="Caller ID to use (optional)")
+    parser.add_argument("--webhook-mode", action="store_true",
+                        help="Run in webhook mode (requires -u, -t, -b)")
 
     args = parser.parse_args()
 
     logger.debug(f"url: {args.url}")
     logger.debug(f"token: {args.token}")
     logger.debug(f"body: {args.body}")
-    if not all([args.url, args.token, args.body]):
-        logger.error("All arguments (-u, -t, -b) are required")
+    logger.debug(f"phone: {args.phone}")
+    logger.debug(f"caller_id: {args.caller_id}")
+    logger.debug(f"webhook_mode: {args.webhook_mode}")
+
+    # Determine mode: webhook mode or direct mode (default)
+    webhook_mode = args.webhook_mode and all([args.url, args.token, args.body])
+
+    if args.webhook_mode and not all([args.url, args.token, args.body]):
+        logger.error("Webhook mode requires all arguments: -u, -t, -b")
         parser.print_help()
         sys.exit(1)
 
-    await run_bot(args.url, args.token, args.body)
+    if webhook_mode:
+        # Webhook mode
+        logger.info("Running in webhook mode")
+        await run_bot(args.url, args.token, args.body)
+    else:
+        # Default direct mode - create room and run bot
+        logger.info(
+            "Running in direct mode - creating room and calling phone number")
+
+        if not daily_api_key:
+            logger.error("DAILY_API_KEY environment variable is required")
+            sys.exit(1)
+
+        if not google_api_key:
+            logger.error("GOOGLE_API_KEY environment variable is required")
+            sys.exit(1)
+
+        # Determine phone number: command line arg takes precedence over env var
+        phone_number = args.phone or to_phone_number
+        if not phone_number:
+            logger.error(
+                "Phone number is required. Set TO_PHONE_NUMBER environment variable or use -p argument")
+            sys.exit(1)
+
+        try:
+            # Create room and token
+            room_url, bot_token = await create_room_and_tokens(daily_api_key, daily_api_url)
+
+            # Create body configuration for dial-out
+            dialout_settings = {
+                "phone_number": phone_number
+            }
+            if args.caller_id:
+                dialout_settings["caller_id"] = args.caller_id
+
+            body_config = {
+                "dialout_settings": dialout_settings
+            }
+
+            body_json = json.dumps(body_config)
+
+            logger.info(f"Created room: {room_url}")
+            logger.info(f"Calling phone number: {phone_number}")
+            if args.caller_id:
+                logger.info(f"Using caller ID: {args.caller_id}")
+
+            # Run the bot
+            await run_bot(room_url, bot_token, body_json)
+
+        except Exception as e:
+            logger.error(f"Failed to create room and run bot: {e}")
+            sys.exit(1)
 
 
 if __name__ == "__main__":
