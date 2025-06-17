@@ -199,8 +199,8 @@ class UserAudioCollector(FrameProcessor):
         self._context = context
         self._user_context_aggregator = user_context_aggregator
         self._audio_frames = []
-        # this should match VAD start_secs (hardcoding for now)
-        self._start_secs = 0.2
+        # Increase pre-buffer to 0.3s for better first-word capture
+        self._start_secs = 0.3
         self._user_speaking = False
 
     async def process_frame(self, frame, direction):
@@ -480,12 +480,10 @@ async def run_bot(
             vad_analyzer=SileroVADAnalyzer(
                 sample_rate=16000,      # Match the TTS sample rate
                 params=VADParams(
-                    confidence=0.6,         # Slightly lower than default for better detection
-                    # Slightly faster than default (0.2)
-                    start_secs=0.15,
-                    # Slightly shorter than default (0.8)
-                    stop_secs=0.7,
-                    min_volume=0.5          # Slightly lower than default (0.6)
+                    confidence=0.5,         # Lower for more sensitivity
+                    start_secs=0.1,         # Faster trigger
+                    stop_secs=0.7,          # Unchanged
+                    min_volume=0.5          # Unchanged
                 )
             )
         )
