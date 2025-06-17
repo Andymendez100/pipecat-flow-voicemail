@@ -9,7 +9,7 @@ import asyncio
 import json
 import os
 import sys
-from typing import Any
+from typing import Any, TypedDict
 import aiohttp
 
 from dotenv import load_dotenv
@@ -29,6 +29,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.cartesia.stt import CartesiaSTTService, CartesiaLiveOptions
 from pipecat.transcriptions.language import Language
@@ -40,6 +41,8 @@ from pipecat.transports.services.daily import (
     DailyParams,
     DailyTransport,
 )
+
+from pipecat_flows import FlowArgs, FlowManager, FlowResult, FlowsFunctionSchema, NodeConfig
 
 load_dotenv(override=True)
 
@@ -285,6 +288,153 @@ class FunctionHandlers:
         # Update state to indicate human was detected
         self.call_flow_state.set_human_detected()
         await params.llm.push_frame(StopTaskFrame(), FrameDirection.UPSTREAM)
+
+
+# ------------ PIPECAT FLOWS FOR HUMAN CONVERSATION ------------
+
+
+# Type definitions for flows
+class GreetingResult(FlowResult):
+    greeting_complete: bool
+
+
+class ConversationResult(FlowResult):
+    message: str
+
+
+class EndConversationResult(FlowResult):
+    status: str
+
+
+# Flow function handlers
+async def handle_greeting(
+    args: FlowArgs, flow_manager: FlowManager
+) -> tuple[GreetingResult, NodeConfig]:
+    """Handle initial greeting to human."""
+    logger.debug("handle_greeting executing")
+
+    result = GreetingResult(greeting_complete=True)
+    next_node = create_conversation_node()
+
+    return result, next_node
+
+
+async def handle_conversation(
+    args: FlowArgs, flow_manager: FlowManager
+) -> tuple[ConversationResult, NodeConfig]:
+    """Handle ongoing conversation with human."""
+    message = args.get("message", "")
+    logger.debug(f"handle_conversation executing with message: {message}")
+
+    result = ConversationResult(message=message)
+
+    # Continue with the same conversation node for ongoing chat
+    next_node = create_conversation_node()
+
+    return result, next_node
+
+
+async def handle_end_conversation(
+    args: FlowArgs, flow_manager: FlowManager
+) -> tuple[EndConversationResult, NodeConfig]:
+    """Handle ending the conversation."""
+    logger.debug("handle_end_conversation executing")
+
+    result = EndConversationResult(status="completed")
+    next_node = create_end_node()
+
+    return result, next_node
+
+
+# Node configurations for human conversation flow
+def create_greeting_node() -> NodeConfig:
+    """Create the initial greeting node for human conversation."""
+    return {
+        "name": "greeting",
+        "role_messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a friendly chatbot. Your responses will be "
+                    "converted to audio, so avoid special characters. "
+                    "Be conversational and helpful."
+                ),
+            }
+        ],
+        "task_messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Greet the human warmly and ask how you can help them today. "
+                    "After greeting them, call handle_greeting to proceed to the conversation."
+                ),
+            }
+        ],
+        "functions": [
+            FlowsFunctionSchema(
+                name="handle_greeting",
+                description="Mark that greeting is complete and proceed to conversation",
+                properties={},
+                required=[],
+                handler=handle_greeting,
+            )
+        ],
+    }
+
+
+def create_conversation_node() -> NodeConfig:
+    """Create the main conversation node."""
+    return {
+        "name": "conversation",
+        "task_messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are having a friendly conversation with a human. "
+                    "Listen to what they say and respond helpfully. "
+                    "Keep your responses brief and conversational. "
+                    "If they indicate they want to end the conversation (saying goodbye, "
+                    "thanks, that's all, etc.), call handle_end_conversation. "
+                    "Otherwise, use handle_conversation to continue the chat."
+                ),
+            }
+        ],
+        "functions": [
+            FlowsFunctionSchema(
+                name="handle_conversation",
+                description="Continue the conversation with the human",
+                properties={
+                    "message": {"type": "string", "description": "The response message"}
+                },
+                required=["message"],
+                handler=handle_conversation,
+            ),
+            FlowsFunctionSchema(
+                name="handle_end_conversation",
+                description="End the conversation when the human is ready to finish",
+                properties={},
+                required=[],
+                handler=handle_end_conversation,
+            ),
+        ],
+    }
+
+
+def create_end_node() -> NodeConfig:
+    """Create the final conversation end node."""
+    return {
+        "name": "end",
+        "task_messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Thank the person for the conversation and say goodbye. "
+                    "Keep it brief and friendly."
+                ),
+            }
+        ],
+        "post_actions": [{"type": "end_conversation"}],
+    }
 
 
 # ------------ MAIN FUNCTION ------------
@@ -583,44 +733,23 @@ async def run_bot(
             print("!!! Bot terminated call; not proceeding to human conversation")
         return
 
-    # ------------ HUMAN CONVERSATION PHASE SETUP ------------
+    # ------------ HUMAN CONVERSATION PHASE SETUP (FLOWS-BASED) ------------
 
-    # Get human conversation prompt
-    human_conversation_system_instruction = """You are Chatbot talking to a human. Be friendly and helpful.
+    print("!!! starting human conversation pipeline with flows")
 
-        Start with: "Hello! I'm a friendly chatbot. How can I help you today?"
-
-        Keep your responses brief and to the point. Listen to what the person says.
-
-        When the person indicates they're done with the conversation by saying something like:
-        - "Goodbye"
-        - "That's all"
-        - "I'm done"
-        - "Thank you, that's all I needed"
-
-        THEN say: "Thank you for chatting. Goodbye!" and call the terminate_call function."""
-
-    # Initialize human conversation LLM
+    # Initialize human conversation LLM for flows
     human_conversation_llm = GoogleLLMService(
         model="models/gemini-2.0-flash-001",  # Full model for better conversation
         api_key=google_api_key,
-        system_instruction=human_conversation_system_instruction,
-        tools=tools,
     )
 
-    # Initialize context and context aggregator
-    human_conversation_context = GoogleLLMContext()
+    # Initialize context and context aggregator for flows
+    human_conversation_context = OpenAILLMContext()
     human_conversation_context_aggregator = human_conversation_llm.create_context_aggregator(
         human_conversation_context
     )
 
-    # Register terminate function with the human conversation LLM
-    human_conversation_llm.register_function(
-        "terminate_call", lambda params: terminate_call(
-            params, call_flow_state)
-    )
-
-    # Build human conversation pipeline
+    # Build human conversation pipeline for flows
     human_conversation_pipeline = Pipeline(
         [
             transport.input(),  # Transport user input
@@ -639,33 +768,24 @@ async def run_bot(
         params=PipelineParams(allow_interruptions=True),
     )
 
+    # Initialize flow manager
+    flow_manager = FlowManager(
+        task=human_conversation_pipeline_task,
+        llm=human_conversation_llm,
+        context_aggregator=human_conversation_context_aggregator,
+    )
+
     # Update participant left handler for human conversation phase
     @transport.event_handler("on_participant_left")
     async def on_participant_left(transport, participant, reason):
         await voicemail_detection_pipeline_task.queue_frame(EndFrame())
         await human_conversation_pipeline_task.queue_frame(EndFrame())
 
-    # ------------ RUN HUMAN CONVERSATION PIPELINE ------------
+    # ------------ RUN HUMAN CONVERSATION PIPELINE WITH FLOWS ------------
 
-    print("!!! starting human conversation pipeline")
-
-    # Initialize the context with system message
-    human_conversation_context_aggregator.user().set_messages(
-        [
-            {
-                "role": "system",
-                "content": human_conversation_system_instruction,
-            }
-        ]
-    )
-
-    # Queue the context frame to start the conversation
-    await human_conversation_pipeline_task.queue_frames(
-        [human_conversation_context_aggregator.user().get_context_frame()]
-    )
-
-    # Run the human conversation pipeline
+    # Run the human conversation pipeline first, then set up flows
     try:
+        # Just start the pipeline without flows for now to test
         await runner.run(human_conversation_pipeline_task)
     except Exception as e:
         logger.error(f"Error in voicemail detection pipeline: {e}")
