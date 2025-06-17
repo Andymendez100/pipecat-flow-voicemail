@@ -9,7 +9,8 @@ import asyncio
 import json
 import os
 import sys
-from typing import Any, TypedDict
+import time
+from typing import Any
 import aiohttp
 
 from dotenv import load_dotenv
@@ -53,6 +54,7 @@ logger.add(sys.stderr, level="DEBUG")
 daily_api_key = os.getenv("DAILY_API_KEY", "")
 daily_api_url = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
 to_phone_number = os.getenv("TO_PHONE_NUMBER", "")
+partner_phone_number = os.getenv("PARTNER_PHONE_NUMBER", "")
 google_api_key = os.getenv("GOOGLE_API_KEY", "")
 
 
@@ -86,10 +88,17 @@ async def create_room_and_tokens(api_key: str, env: str = "prod") -> tuple[str, 
     async with aiohttp.ClientSession() as session:
         # Create room
         room_config = {
-            "properties": {"max_participants": 3,
-                           "geo": 'us-west-2',
-                           "enable_dialout": True
-                           }
+            "properties": {
+                "enable_shared_chat_history": False,
+                "max_participants": 3,
+                "geo": 'us-west-2',
+                "enable_dialout": True,
+                "dialout_config": {
+                    "allow_room_start": True,
+                    "dialout_geo": "us-west-2",
+                },
+                "exp": int(time.time()) + (30 * 60)  # 30 minutes
+            }
         }
 
         async with session.post(f"{api_url}/rooms", headers=headers, json=room_config) as response:
@@ -106,8 +115,9 @@ async def create_room_and_tokens(api_key: str, env: str = "prod") -> tuple[str, 
         bot_token_config = {
             "properties": {
                 "room_name": room_data["name"],
+                "user_name": "bot",
+                "user_id": "bot",
                 "is_owner": True,
-                "user_name": "Voicemail Bot"
             }
         }
 
@@ -465,6 +475,9 @@ async def run_bot(
 
     """
     # ------------ CONFIGURATION AND SETUP ------------
+    # Store participant ID to transfer to flow_manager.state later
+    consumer_participant_id = None
+
     logger.info(f"Starting bot with room: {room_url}")
     logger.info(f"Token: {token}")
     logger.info(f"Body: {body}")
@@ -582,7 +595,7 @@ async def run_bot(
         - Any robotic/automated voice with formal phrasing
 
         HUMAN INDICATORS - Call switch_to_human_conversation if you hear:
-        - "Hello" or "Hello?" 
+        - "Hello" or "Hello?"
         - "Hi" or "Hey"
         - "Is anyone there?"
         - Natural conversational tone
@@ -592,7 +605,7 @@ async def run_bot(
         BE DECISIVE: If you hear "Hello?" or "Hello? Is anyone there?" - this is clearly a HUMAN, call switch_to_human_conversation IMMEDIATELY.
 
         DO NOT say anything until you've determined if this is a voicemail or human.
-        
+
         When you detect a voicemail system, call switch_to_voicemail_response and then FOLLOW THE EXACT INSTRUCTIONS it provides, including calling terminate_call when instructed.
 
         Only call the terminate_call function when explicitly instructed to do so by a function response or if there's an error."""
@@ -658,7 +671,16 @@ async def run_bot(
     dialout_successful = False
 
     # Build dialout parameters conditionally
-    dialout_params = {"phoneNumber": phone_number}
+    dialout_params = {"phoneNumber": phone_number,
+                      "displayName": "consumer",
+                      "userId": "consumer",
+                      "permissions": {
+                          "canReceive": {
+                              "base": False,
+                              "byUserId": {
+                                  "bot": True
+                              }
+                          }}}
     if caller_id:
         dialout_params["callerId"] = caller_id
         logger.debug(f"Including caller ID in dialout: {caller_id}")
@@ -716,7 +738,9 @@ async def run_bot(
 
     @transport.event_handler("on_first_participant_joined")
     async def on_first_participant_joined(transport, participant):
+        nonlocal consumer_participant_id
         logger.debug(f"First participant joined: {participant['id']}")
+        consumer_participant_id = participant["id"]
 
     @transport.event_handler("on_participant_left")
     async def on_participant_left(transport, participant, reason):
@@ -797,12 +821,192 @@ async def run_bot(
         transport=transport,
     )
 
+    # Transfer stored participant ID to flow_manager.state
+    if consumer_participant_id:
+        flow_manager.state["consumer_participant_id"] = consumer_participant_id
+        logger.debug(
+            f"Transferred participant ID to flow_manager.state: {consumer_participant_id}")
+
+    # Store the phone number in flow_manager.state
+    flow_manager.state["to_phone_number"] = phone_number
+    logger.debug(f"Stored phone number in flow_manager.state: {phone_number}")
+
+    # Store the partner phone number in flow_manager.state
+    flow_manager.state["partner_phone_number"] = partner_phone_number
+    logger.debug(
+        f"Stored partner phone number in flow_manager.state: {partner_phone_number}")
+
     # Update participant left handler for human conversation phase
     @transport.event_handler("on_participant_left")
     async def on_participant_left(transport, participant, reason):
         await voicemail_detection_pipeline_task.queue_frame(EndFrame())
         await human_conversation_pipeline_task.queue_frame(EndFrame())
+        participant_id = participant.get("id")
+        # Use userId for more reliable identification if available
+        participant_user_id = participant.get("info", {}).get("userId")
+        participant_display_name = participant_user_id if participant_user_id else participant.get(
+            'user_name', 'Unknown')
 
+        logger.info(
+            f"Participant '{participant_display_name}' (ID: {participant_id}) left. Reason: {reason}")
+
+        consumer_participant_id = flow_manager.state.get(
+            "consumer_participant_id")
+        # Check if the leaving participant is the consumer
+        consumer_left_this_event = (
+            participant_id == consumer_participant_id)
+        # Check the transfer initiation state (using the key "initate_transfer" as seen in other logs)
+        is_initiating_transfer = flow_manager.state.get(
+            "initate_transfer", False)
+
+        dialback_consumer = flow_manager.state.get(
+            "dialback_consumer", False)
+        second_transfer_attempt = flow_manager.state.get(
+            "second_transfer_attempt", False)
+
+        if consumer_left_this_event:
+            logger.info(
+                "Consumer has left the call (on_participant_left).")
+            flow_manager.state["consumer_hung_up"] = True
+
+            current_node = flow_manager.state.get("current_node_name", "")
+
+            if current_node.startswith("page_35_"):
+                logger.info(
+                    "Consumer left call while Page 35 is active. Page 35 will manage call termination.")
+                # Page 35 has ActionConfig(type="end_conversation")
+            elif current_node == "page_6_specialist_intro_node":
+                logger.info(
+                    "Consumer left call while Page 6 is active. Page 6/24 will manage call.")
+                # Page 6 logic will see consumer_hung_up state and transition to Page 24.
+            elif is_initiating_transfer:
+                logger.info(
+                    "Consumer left call while a partner transfer was being initiated. "
+                    "Bot will remain active. Partner dialout handlers or Page 6 will use 'consumer_hung_up' state.")
+                # DO NOT CANCEL TASK HERE. Let partner connection logic or Page 6 handle it.
+            else:
+                logger.info(
+                    "Consumer left call. No specific page handling or active transfer. Cancelling task.")
+                if human_conversation_pipeline_task:  # MODIFIED
+                    await human_conversation_pipeline_task.cancel()
+                return  # Exit if task is cancelled to avoid further checks
+
+            # Check if all human participants (those with userId 'consumer' or 'partner') have left the Daily room.
+        current_room_participants = transport.participants()
+        # Should ideally not happen if bot is still running, but good check.
+        if not current_room_participants:
+            logger.info(
+                "No participants found via transport.participants(). Assuming all left. Cancelling task.")
+            if human_conversation_pipeline_task:  # MODIFIED
+                await human_conversation_pipeline_task.cancel()
+            return
+
+        human_user_ids_in_room = {
+            p_data.get("info", {}).get("userId")
+            for p_data in current_room_participants.values()
+            if p_data.get("info", {}).get("userId") in {"consumer", "partner"}
+        }
+
+        if not human_user_ids_in_room:
+            # If the consumer is the one who just left AND a transfer is in progress,
+            # don't cancel here. We are waiting for the partner who might not be in the Daily room yet.
+            if consumer_left_this_event and is_initiating_transfer:
+                logger.info(
+                    "All human userIDs ('consumer'/'partner') are absent from Daily room, "
+                    "but consumer left during transfer initiation. Waiting for partner dialout outcome.")
+
+                # If we are are haning up on the partner, and we plan to dialback consumer on failed transfer
+                # but not if this is the second failed transfer attempt
+            elif not consumer_left_this_event and dialback_consumer and not second_transfer_attempt:
+                logger.info(
+                    "All human userIDs ('consumer'/'partner') are absent from Daily room, "
+                    "but consumer left during transfer. Will attempt reconnecting with consumer.")
+
+            else:
+                logger.info(
+                    "All human userIDs ('consumer'/'partner') appear to have left the Daily room. Cancelling pipeline task.")
+                if human_conversation_pipeline_task:  # MODIFIED
+                    await human_conversation_pipeline_task.cancel()
+        else:
+            remaining_ids = list(human_user_ids_in_room)
+            logger.info(
+                f"Human participants (userId 'consumer' or 'partner') still in Daily room: {remaining_ids}. Bot will continue.")
+
+    @transport.event_handler("on_participant_joined")
+    async def on_participant_joined(transport, participant):
+        """Handle participant joining during human conversation phase."""
+        try:
+            # Check if we're in human conversation phase (flow_manager exists)
+            try:
+                flow_manager_state = flow_manager.state
+            except NameError:
+                logger.debug(
+                    "flow_manager not available yet - skipping participant join handling")
+                return
+
+            logger.info(f"Participant joined: {participant}")
+            callLeg = participant.get("info", {}).get("userId")
+            dialback_consumer = flow_manager.state.get(
+                "dialback_consumer", False)
+            initate_transfer = flow_manager.state.get(
+                "initate_transfer", False)
+
+            participant_id = participant["id"]
+
+            # Store using both the dynamic key and standardized keys for compatibility
+            flow_manager.state[f"{callLeg}_participant_id"] = participant_id
+
+            logger.info(
+                f"Participant '{callLeg}' joined with ID: {participant_id}")
+            logger.info(
+                f"Current flow manager state - dialback_consumer: {dialback_consumer}, initate_transfer: {flow_manager.state.get('initate_transfer', False)}")
+
+            if callLeg == "consumer":
+                if dialback_consumer:
+                    from script_pages.consumer_dial_back import create_consumer_dialback_greeting_node
+                    logger.info(
+                        "Consumer joined after dialback. Transitioning to consumer dialback greeting node.")
+
+                    # Set the consumer dialback greeting node
+                    await flow_manager.set_node("consumer_dialback_greeting_node", create_consumer_dialback_greeting_node(
+                        flow_manager))
+
+                else:
+                    # Standard consumer flow (first call) - this will be handled by on_dialout_answered
+                    logger.info(
+                        "Consumer joined for initial call - will be handled by on_dialout_answered")
+
+            elif callLeg == "partner":
+                logger.debug("Partner joined - setting consumer state")
+                flow_manager.state["partner_participant_id"] = participant_id
+
+                customer_participant_id = flow_manager.state.get(
+                    'consumer_participant_id')
+                if customer_participant_id:
+                    await transport.update_remote_participants(
+                        remote_participants={
+                            customer_participant_id: {
+                                "permissions": {
+                                    "canReceive": {
+                                        "base": False,
+                                        "byUserId": {"hold-music": True, "partner": False},
+                                    }
+                                },
+                            }
+                        }
+                    )
+
+                    if (initate_transfer == True):
+                        if flow_manager.state.get("consumer_hung_up"):
+                            from script_pages.page24 import create_page_24_entry_node
+                            await flow_manager.set_node("create_page_24_entry_node", create_page_24_entry_node(flow_manager))
+                        else:
+                            # once the partner has answered, we can set the next node
+                            from script_pages.page6 import create_page_6_entry_node
+                            await flow_manager.set_node("create_page_6_entry_node", create_page_6_entry_node(flow_manager))
+        except Exception as e:
+            logger.error(f"Error handling participant join: {e}")
+            logger.exception("Full traceback:")
     # Initialize flows when human conversation starts
     flow_initialized = False
 
@@ -839,90 +1043,50 @@ async def run_bot(
 
 
 async def main():
-    """Parse command line arguments and run the bot."""
-    parser = argparse.ArgumentParser(description="Voicemail Detection Bot")
-    parser.add_argument("-u", "--url", type=str,
-                        help="Room URL (webhook mode)")
-    parser.add_argument("-t", "--token", type=str,
-                        help="Room Token (webhook mode)")
-    parser.add_argument("-b", "--body", type=str,
-                        help="JSON configuration string (webhook mode)")
-    parser.add_argument("-p", "--phone", type=str,
-                        help="Phone number to call (overrides TO_PHONE_NUMBER env var)")
-    parser.add_argument("-c", "--caller-id", type=str,
-                        help="Caller ID to use (optional)")
-    parser.add_argument("--webhook-mode", action="store_true",
-                        help="Run in webhook mode (requires -u, -t, -b)")
 
-    args = parser.parse_args()
+    # Default direct mode - create room and run bot
+    logger.info(
+        "Running in direct mode - creating room and calling phone number")
 
-    logger.debug(f"url: {args.url}")
-    logger.debug(f"token: {args.token}")
-    logger.debug(f"body: {args.body}")
-    logger.debug(f"phone: {args.phone}")
-    logger.debug(f"caller_id: {args.caller_id}")
-    logger.debug(f"webhook_mode: {args.webhook_mode}")
-
-    # Determine mode: webhook mode or direct mode (default)
-    webhook_mode = args.webhook_mode and all([args.url, args.token, args.body])
-
-    if args.webhook_mode and not all([args.url, args.token, args.body]):
-        logger.error("Webhook mode requires all arguments: -u, -t, -b")
-        parser.print_help()
+    if not daily_api_key:
+        logger.error("DAILY_API_KEY environment variable is required")
         sys.exit(1)
 
-    if webhook_mode:
-        # Webhook mode
-        logger.info("Running in webhook mode")
-        await run_bot(args.url, args.token, args.body)
-    else:
-        # Default direct mode - create room and run bot
-        logger.info(
-            "Running in direct mode - creating room and calling phone number")
+    if not google_api_key:
+        logger.error("GOOGLE_API_KEY environment variable is required")
+        sys.exit(1)
 
-        if not daily_api_key:
-            logger.error("DAILY_API_KEY environment variable is required")
-            sys.exit(1)
+    # Determine phone number: command line arg takes precedence over env var
+    phone_number = to_phone_number
+    if not phone_number:
+        logger.error(
+            "Phone number is required. Set TO_PHONE_NUMBER environment variable or use -p argument")
+        sys.exit(1)
 
-        if not google_api_key:
-            logger.error("GOOGLE_API_KEY environment variable is required")
-            sys.exit(1)
+    try:
+        # Create room and token
+        room_url, bot_token = await create_room_and_tokens(daily_api_key, daily_api_url)
 
-        # Determine phone number: command line arg takes precedence over env var
-        phone_number = args.phone or to_phone_number
-        if not phone_number:
-            logger.error(
-                "Phone number is required. Set TO_PHONE_NUMBER environment variable or use -p argument")
-            sys.exit(1)
+        # Create body configuration for dial-out
+        dialout_settings = {
+            "phone_number": phone_number
+        }
 
-        try:
-            # Create room and token
-            room_url, bot_token = await create_room_and_tokens(daily_api_key, daily_api_url)
+        body_config = {
+            "dialout_settings": dialout_settings
+        }
 
-            # Create body configuration for dial-out
-            dialout_settings = {
-                "phone_number": phone_number
-            }
-            if args.caller_id:
-                dialout_settings["caller_id"] = args.caller_id
+        body_json = json.dumps(body_config)
 
-            body_config = {
-                "dialout_settings": dialout_settings
-            }
+        logger.info(f"Created room: {room_url}")
+        logger.info(f"Calling phone number: {phone_number}")
 
-            body_json = json.dumps(body_config)
+        # Run the bot
+        await run_bot(room_url, bot_token, body_json)
 
-            logger.info(f"Created room: {room_url}")
-            logger.info(f"Calling phone number: {phone_number}")
-            if args.caller_id:
-                logger.info(f"Using caller ID: {args.caller_id}")
-
-            # Run the bot
-            await run_bot(room_url, bot_token, body_json)
-
-        except Exception as e:
-            logger.error(f"Failed to create room and run bot: {e}")
-            sys.exit(1)
+    except Exception as e:
+        logger.error(f"Failed to create room and run bot: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

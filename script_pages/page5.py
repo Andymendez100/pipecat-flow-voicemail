@@ -250,7 +250,7 @@ The user will be placed on hold with music while the specialist connection is es
 
 def create_page_5_entry_node(flow_manager: "FlowManager") -> NodeConfig:
     """UNIFIED NODE 1: Asks the user to confirm their callback number."""
-    lead_first_name = flow_manager.state.get("lead_first_name", "")
+    lead_first_name = flow_manager.state.get("lead_first_name", "the consumer")
     bot_script = f"Thanks! {lead_first_name} I'm going to place you on hold while I connect, then I will bring you back on the line and introduce you. This will only take a moment. Is this phone number the best way to reach you just in case we're disconnected?"
 
     # Store the greeting line for logging
