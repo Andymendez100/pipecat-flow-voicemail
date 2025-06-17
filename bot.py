@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     EndFrame,
     EndTaskFrame,
@@ -476,7 +477,17 @@ async def run_bot(
         params=DailyParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            vad_analyzer=SileroVADAnalyzer()
+            vad_analyzer=SileroVADAnalyzer(
+                sample_rate=16000,      # Match the TTS sample rate
+                params=VADParams(
+                    confidence=0.6,         # Slightly lower than default for better detection
+                    # Slightly faster than default (0.2)
+                    start_secs=0.15,
+                    # Slightly shorter than default (0.8)
+                    stop_secs=0.7,
+                    min_volume=0.5          # Slightly lower than default (0.6)
+                )
+            )
         )
 
     )
@@ -558,13 +569,17 @@ async def run_bot(
 
         DO NOT say anything until you've determined if this is a voicemail or human.
 
-        When you detect a voicemail system, call switch_to_voicemail_response and then FOLLOW THE EXACT INSTRUCTIONS it provides, including calling terminate_call when instructed.
+        When you detect a voicemail system, call switch_to_voicemail_response and then say EXACTLY what the function response tells you to say.
+
+        When you detect a human, call switch_to_human_conversation and then say EXACTLY what the function response tells you to say.
+
+        When a function returns a message for you to say, you MUST say that exact message. Do not refuse to speak or say you cannot speak.
 
         Only call the terminate_call function when explicitly instructed to do so by a function response or if there's an error."""
 
     # Initialize voicemail detection LLM
     voicemail_detection_llm = GoogleLLMService(
-        model="models/gemini-2.0-flash-lite",  # Lighter model for faster detection
+        model="models/gemini-2.5-flash-lite-preview-06-17",
         api_key=google_api_key,
         system_instruction=system_instruction,
         tools=tools,
@@ -572,6 +587,7 @@ async def run_bot(
 
     # Initialize context and context aggregator
     voicemail_detection_context = GoogleLLMContext()
+
     voicemail_detection_context_aggregator = voicemail_detection_llm.create_context_aggregator(
         voicemail_detection_context
     )
@@ -732,11 +748,12 @@ async def run_bot(
 
     # Initialize human conversation LLM for flows
     human_conversation_llm = GoogleLLMService(
-        model="models/gemini-2.0-flash-001",  # Full model for better conversation
+        model="models/gemini-2.5-flash",  # Full model for better conversation
         api_key=google_api_key,
     )
 
-    # Initialize context and context aggregator for flows
+    # Initialize context and context aggregator for flows - use GoogleLLMContext for GoogleLLMService
+    # human_conversation_context = GoogleLLMContext()
     human_conversation_context = OpenAILLMContext()
     human_conversation_context_aggregator = human_conversation_llm.create_context_aggregator(
         human_conversation_context
@@ -744,8 +761,8 @@ async def run_bot(
 
     # Clear any lingering transcription state in the transport
     # This prevents old audio/transcription from interfering with the new pipeline
-    await transport.stop_transcription()
-    await transport.start_transcription()
+    # await transport.stop_transcription()
+    # await transport.start_transcription()
 
     # Build human conversation pipeline for flows
     human_conversation_pipeline = Pipeline(
@@ -967,9 +984,12 @@ async def run_bot(
                             from script_pages.page24 import create_page_24_entry_node
                             await flow_manager.set_node("create_page_24_entry_node", create_page_24_entry_node(flow_manager))
                         else:
-                            # once the partner has answered, we can set the next node
-                            from script_pages.page6 import create_page_6_entry_node
-                            await flow_manager.set_node("create_page_6_entry_node", create_page_6_entry_node(flow_manager))
+                            # Store that partner has joined, but don't immediately switch to page 6
+                            # Let the current flow (page 5) complete its logic first
+                            flow_manager.state["partner_joined"] = True
+                            flow_manager.state["partner_participant_id"] = participant_id
+                            logger.debug(
+                                "Partner joined - stored in state, waiting for flow transition")
         except Exception as e:
             logger.error(f"Error handling participant join: {e}")
             logger.exception("Full traceback:")
