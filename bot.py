@@ -271,10 +271,13 @@ class FunctionHandlers:
 
     async def voicemail_response(self, params: FunctionCallParams):
         """Function the bot can call to leave a voicemail message."""
-        message = """You are Chatbot leaving a voicemail message. Say EXACTLY this message and then terminate the call:
+        message = "Say this message exactly: 'Hello, this is a message for Pipecat example user. This is Chatbot. Please call back on 123-456-7891. Thank you.' Then call the terminate_call function."
 
-                    'Hello, this is a message for Pipecat example user. This is Chatbot. Please call back on 123-456-7891. Thank you.'"""
+        # Update state to indicate voicemail was detected and call should be terminated
+        self.call_flow_state.set_voicemail_detected()
+        self.call_flow_state.set_call_terminated()
 
+        # Send the message - let the LLM speak it and then call terminate_call
         await params.result_callback(message)
 
     async def human_conversation(self, params: FunctionCallParams):
