@@ -354,11 +354,11 @@ async def run_bot(
         transport_params,
     )
 
-    # Initialize TTS
+    # Initialize TTS with optimized settings for clarity
     tts = CartesiaTTSService(
         api_key=os.getenv("CARTESIA_API_KEY", ""),
-        # Use Helpful Woman voice by default
-        voice_id="b7d50908-b17c-442d-ad8d-810c63997ed9",
+        voice_id="6f84f4b8-58a2-430c-8c79-688dad597532",  # Helpful Woman voice
+        sample_rate=16000,  # Standard sample rate that matches input
     )
 
     # Initialize speech-to-text service (for human conversation phase)
@@ -404,9 +404,9 @@ async def run_bot(
         }
     ]
 
-    system_instruction = """You are Chatbot trying to determine if this is a voicemail system or a human.
+    system_instruction = """You are Chatbot trying to determine if this is a voicemail system or a human. Make this decision QUICKLY based on the first audio you hear.
 
-        If you hear any of these phrases (or very similar ones):
+        VOICEMAIL INDICATORS - Call switch_to_voicemail_response if you hear:
         - "Please leave a message after the beep"
         - "No one is available to take your call"
         - "Record your message after the tone"
@@ -416,14 +416,23 @@ async def run_bot(
         - "The person you are trying to reach..."
         - "The number you have dialed..."
         - "Your call has been forwarded to an automated voice messaging system"
+        - "Has been forwarded to voice mail"
+        - "At the tone"
+        - Any robotic/automated voice with formal phrasing
 
-        Then call the function switch_to_voicemail_response.
+        HUMAN INDICATORS - Call switch_to_human_conversation if you hear:
+        - "Hello" or "Hello?" 
+        - "Hi" or "Hey"
+        - "Is anyone there?"
+        - Natural conversational tone
+        - Questions directed at you
+        - Informal speech patterns
 
-        If it sounds like a human (saying hello, asking questions, etc.), call the function switch_to_human_conversation.
+        BE DECISIVE: If you hear "Hello?" or "Hello? Is anyone there?" - this is clearly a HUMAN, call switch_to_human_conversation IMMEDIATELY.
 
         DO NOT say anything until you've determined if this is a voicemail or human.
 
-        If you are asked to terminate the call, **IMMEDIATELY** call the `terminate_call` function. **FAILURE TO CALL `terminate_call` IMMEDIATELY IS A MISTAKE.**"""
+        If you are asked to terminate the call, **IMMEDIATELY** call the `terminate_call` function."""
 
     # Initialize voicemail detection LLM
     voicemail_detection_llm = GoogleLLMService(
