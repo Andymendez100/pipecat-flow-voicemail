@@ -314,19 +314,21 @@ class EndConversationResult(FlowResult):
 # Flow function handlers
 async def handle_greeting(
     args: FlowArgs, flow_manager: FlowManager
-) -> tuple[GreetingResult, NodeConfig]:
+) -> tuple[GreetingResult, str]:
     """Handle initial greeting to human."""
     logger.debug("handle_greeting executing")
 
     result = GreetingResult(greeting_complete=True)
-    next_node = create_conversation_node()
 
-    return result, next_node
+    # Set up the conversation node dynamically
+    await flow_manager.set_node("conversation", create_conversation_node())
+
+    return result, "conversation"
 
 
 async def handle_conversation(
     args: FlowArgs, flow_manager: FlowManager
-) -> tuple[ConversationResult, NodeConfig]:
+) -> tuple[ConversationResult, str]:
     """Handle ongoing conversation with human."""
     message = args.get("message", "")
     logger.debug(f"handle_conversation executing with message: {message}")
@@ -334,21 +336,21 @@ async def handle_conversation(
     result = ConversationResult(message=message)
 
     # Continue with the same conversation node for ongoing chat
-    next_node = create_conversation_node()
-
-    return result, next_node
+    return result, "conversation"
 
 
 async def handle_end_conversation(
     args: FlowArgs, flow_manager: FlowManager
-) -> tuple[EndConversationResult, NodeConfig]:
+) -> tuple[EndConversationResult, str]:
     """Handle ending the conversation."""
     logger.debug("handle_end_conversation executing")
 
     result = EndConversationResult(status="completed")
-    next_node = create_end_node()
 
-    return result, next_node
+    # Set up the end node dynamically
+    await flow_manager.set_node("end", create_end_node())
+
+    return result, "end"
 
 
 # Node configurations for human conversation flow
@@ -440,6 +442,7 @@ def create_end_node() -> NodeConfig:
                 ),
             }
         ],
+        "functions": [],  # Required by FlowManager, even if empty
         "post_actions": [{"type": "end_conversation"}],
     }
 
@@ -798,14 +801,23 @@ async def run_bot(
         await voicemail_detection_pipeline_task.queue_frame(EndFrame())
         await human_conversation_pipeline_task.queue_frame(EndFrame())
 
+    # Initialize flows when human conversation starts
+    flow_initialized = False
+
+    async def initialize_human_conversation_flow():
+        nonlocal flow_initialized
+        if not flow_initialized:
+            # Initialize flow manager first
+            await flow_manager.initialize()
+            # Then set the initial node
+            await flow_manager.set_node("greeting", create_greeting_node())
+            flow_initialized = True
+
     # ------------ RUN HUMAN CONVERSATION PIPELINE WITH FLOWS ------------
 
     try:
-        # Initialize the flow manager first
-        await flow_manager.initialize()
-
-        # Set the initial node
-        await flow_manager.set_node("greeting", create_greeting_node())
+        # Initialize the flow first
+        await initialize_human_conversation_flow()
 
         # Run the human conversation pipeline with flows
         await runner.run(human_conversation_pipeline_task)
