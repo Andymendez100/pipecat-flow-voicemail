@@ -684,16 +684,25 @@ async def run_bot(
         logger.debug(f"Dial-out connected: {data}")
 
     @transport.event_handler("on_dialout_answered")
-    async def on_dialout_answered(transport, data):
+    # Renamed arg to avoid confusion
+    async def on_dialout_answered(transport, participant_data):
         nonlocal dialout_successful
-        logger.debug(f"Dial-out answered: {data}")
+        logger.debug(f"Initial consumer dial-out answered: {participant_data}")
         dialout_successful = True  # Mark as successful to stop retries
-        # Automatically start capturing transcription for the participant
-        await transport.capture_participant_transcription(data["sessionId"])
-        # The bot will wait to hear the user before the bot speaks
+
+        consumer_session_id = participant_data.get("sessionId")
+
+        if consumer_session_id:
+            logger.info(
+                f"Consumer answered (session ID: {consumer_session_id}). Starting transcription capture.")
+            # Automatically start capturing transcription for the consumer
+            await transport.capture_participant_transcription(consumer_session_id)
+        else:
+            logger.warning(
+                "Consumer dial-out answered event received without participant sessionId.")
 
     @transport.event_handler("on_dialout_error")
-    async def on_dialout_error(transport, data: Any):
+    async def on_dialout_error(transport, data):
         logger.error(
             f"Dial-out error (attempt {retry_count}/{max_retries}): {data}")
 
@@ -754,6 +763,7 @@ async def run_bot(
 
     # Initialize context and context aggregator for flows - use GoogleLLMContext for GoogleLLMService
     # human_conversation_context = GoogleLLMContext()
+    # TODO: This was identified as a bug previously, should be GoogleLLMContext
     human_conversation_context = OpenAILLMContext()
     human_conversation_context_aggregator = human_conversation_llm.create_context_aggregator(
         human_conversation_context
@@ -819,11 +829,116 @@ async def run_bot(
     flow_manager.state["hold_music_manager"] = HoldMusicManager()
     logger.debug("Stored hold music manager in flow_manager.state")
 
+    # Re-register event handlers for the human conversation phase, now with access to flow_manager
+
+    @transport.event_handler("on_dialout_answered")
+    # transport_obj to avoid conflict
+    async def on_partner_dialout_answered(transport_obj, participant):
+        logger.debug(f"Partner dial-out answered: {participant}")
+        # This handler is now specific to partner dialout, as the initial consumer dialout
+        # is handled by the on_dialout_answered defined before the human pipeline.
+
+        initiate_transfer = flow_manager.state.get("initate_transfer", False)
+        participant_id = participant.get("sessionId")
+
+        if not participant_id:
+            logger.error(
+                "Partner dial-out answered event received without participant sessionId.")
+            return
+
+        # Store partner participant ID
+        flow_manager.state["partner_participant_id"] = participant_id
+        logger.info(f"Partner participant ID set to: {participant_id}")
+
+        # Automatically start capturing transcription for the partner
+        await transport_obj.capture_participant_transcription(participant_id)
+        logger.info(
+            f"Started transcription capture for partner: {participant_id}")
+
+        try:
+            if initiate_transfer:
+                # Stop hold music as partner has answered
+                hold_music_manager = flow_manager.state.get(
+                    "hold_music_manager")
+                if hold_music_manager:
+                    logger.info("Partner answered, stopping hold music.")
+                    await hold_music_manager.stop()
+                    # We might want to pop this from state if page 6 doesn't handle its own cleanup
+                    # flow_manager.state.pop("hold_music_manager", None)
+
+                if flow_manager.state.get("consumer_hung_up"):
+                    logger.info(
+                        "Consumer hung up before partner answered or during transfer. Transitioning to page 24.")
+                    from script_pages.page24 import create_page_24_entry_node
+                    page_24_node_config = create_page_24_entry_node(
+                        flow_manager)
+                    await flow_manager.set_node("create_page_24_entry_node", page_24_node_config)
+                    logger.info("Successfully set node to page 24.")
+                else:
+                    logger.info(
+                        "Partner answered and consumer still present. Transitioning to page 6.")
+                    from script_pages.page6 import create_page_6_entry_node
+                    page_6_node_config = create_page_6_entry_node(flow_manager)
+                    await flow_manager.set_node("create_page_6_entry_node", page_6_node_config)
+                    logger.info("Successfully set node to page 6.")
+            else:
+                logger.warning(
+                    "Partner dial-out answered, but 'initiate_transfer' was false. No transition.")
+        except Exception as e:
+            logger.error(
+                f"Error in on_partner_dialout_answered during transition: {e}", exc_info=True)
+
+    @transport.event_handler("on_dialout_error")
+    # transport_obj to avoid conflict
+    async def on_partner_dialout_error(transport_obj, data):
+        # This handler is now specific to partner dialout
+        logger.error(f"Partner dial-out error: {data}")
+        # Potentially add logic here to inform the consumer or try an alternative partner.
+        # For now, it just logs. If page 5 initiated this, its logic might handle retries or alternative paths.
+        # Consider if we need to transition to a specific "transfer_failed" page.
+        current_node_name = flow_manager.state.get("current_node_name", "")
+        # Check if page 5 is active
+        if current_node_name.startswith("page_5_"):
+            logger.info(
+                "Partner dialout error occurred while on Page 5. Page 5 logic should handle this.")
+            # Page 5 might have its own retry logic or decide to inform the user.
+            # We could also push a specific event or update state for Page 5 to react to.
+            # Signal to Page 5
+            flow_manager.state["partner_dialout_failed"] = True
+            # Example: Trigger a custom event for Page 5 if it's designed to listen
+            # await flow_manager.process_event({"type": "partner_dialout_failed", "data": data})
+
+            # If consumer is still on the line, stop hold music and potentially inform them.
+            if not flow_manager.state.get("consumer_hung_up"):
+                hold_music_manager = flow_manager.state.get(
+                    "hold_music_manager")
+                if hold_music_manager and hold_music_manager.is_playing():
+                    logger.info(
+                        "Stopping hold music due to partner dialout error.")
+                    await hold_music_manager.stop()
+
+                # Transition to a node that informs the user about the failure
+                # This is a placeholder, actual node might be different or part of Page 5's error handling
+                from script_pages.page5 import create_page_5_transfer_failed_node
+                transfer_failed_node = create_page_5_transfer_failed_node(
+                    flow_manager)
+                if transfer_failed_node:
+                    logger.info(
+                        "Transitioning to transfer failed node on Page 5.")
+                    await flow_manager.set_node("page_5_transfer_failed_node", transfer_failed_node)
+                else:
+                    logger.warning(
+                        "Transfer failed node not defined in page5.py. Cannot transition.")
+
+        else:
+            logger.warning(
+                f"Partner dialout error, but not on Page 5 (current: {current_node_name}). No specific action defined.")
+
     # Update participant left handler for human conversation phase
+
     @transport.event_handler("on_participant_left")
-    async def on_participant_left(transport, participant, reason):
-        await voicemail_detection_pipeline_task.queue_frame(EndFrame())
-        await human_conversation_pipeline_task.queue_frame(EndFrame())
+    # transport_obj to avoid conflict
+    async def on_participant_left_human_phase(transport_obj, participant, reason):
         participant_id = participant.get("id")
         # Use userId for more reliable identification if available
         participant_user_id = participant.get("info", {}).get("userId")
@@ -871,6 +986,8 @@ async def run_bot(
                 logger.info(
                     "Consumer left call. No specific page handling or active transfer. Cancelling task.")
                 if human_conversation_pipeline_task:  # MODIFIED
+                    await voicemail_detection_pipeline_task.queue_frame(EndFrame())
+                    await human_conversation_pipeline_task.queue_frame(EndFrame())
                     await human_conversation_pipeline_task.cancel()
                 return  # Exit if task is cancelled to avoid further checks
 
@@ -881,6 +998,8 @@ async def run_bot(
             logger.info(
                 "No participants found via transport.participants(). Assuming all left. Cancelling task.")
             if human_conversation_pipeline_task:  # MODIFIED
+                await voicemail_detection_pipeline_task.queue_frame(EndFrame())
+                await human_conversation_pipeline_task.queue_frame(EndFrame())
                 await human_conversation_pipeline_task.cancel()
             return
 
@@ -909,6 +1028,8 @@ async def run_bot(
                 logger.info(
                     "All human userIDs ('consumer'/'partner') appear to have left the Daily room. Cancelling pipeline task.")
                 if human_conversation_pipeline_task:  # MODIFIED
+                    await voicemail_detection_pipeline_task.queue_frame(EndFrame())
+                    await human_conversation_pipeline_task.queue_frame(EndFrame())
                     await human_conversation_pipeline_task.cancel()
         else:
             remaining_ids = list(human_user_ids_in_room)
@@ -919,14 +1040,6 @@ async def run_bot(
     async def on_participant_joined(transport, participant):
         """Handle participant joining during human conversation phase."""
         try:
-            # Check if we're in human conversation phase (flow_manager exists)
-            try:
-                flow_manager_state = flow_manager.state
-            except NameError:
-                logger.debug(
-                    "flow_manager not available yet - skipping participant join handling")
-                return
-
             logger.info(f"Participant joined: {participant}")
             callLeg = participant.get("info", {}).get("userId")
             dialback_consumer = flow_manager.state.get(
@@ -939,11 +1052,8 @@ async def run_bot(
             # Store using both the dynamic key and standardized keys for compatibility
             flow_manager.state[f"{callLeg}_participant_id"] = participant_id
 
-            logger.info(
+            logger.critical(
                 f"Participant '{callLeg}' joined with ID: {participant_id}")
-            logger.info(
-                f"Current flow manager state - dialback_consumer: {dialback_consumer}, initate_transfer: {flow_manager.state.get('initate_transfer', False)}")
-
             if callLeg == "consumer":
                 if dialback_consumer:
                     from script_pages.consumer_dial_back import create_consumer_dialback_greeting_node
@@ -979,17 +1089,6 @@ async def run_bot(
                         }
                     )
 
-                    if (initate_transfer == True):
-                        if flow_manager.state.get("consumer_hung_up"):
-                            from script_pages.page24 import create_page_24_entry_node
-                            await flow_manager.set_node("create_page_24_entry_node", create_page_24_entry_node(flow_manager))
-                        else:
-                            # Store that partner has joined, but don't immediately switch to page 6
-                            # Let the current flow (page 5) complete its logic first
-                            flow_manager.state["partner_joined"] = True
-                            flow_manager.state["partner_participant_id"] = participant_id
-                            logger.debug(
-                                "Partner joined - stored in state, waiting for flow transition")
         except Exception as e:
             logger.error(f"Error handling participant join: {e}")
             logger.exception("Full traceback:")
