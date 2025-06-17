@@ -44,7 +44,7 @@ from pipecat.transports.services.daily import (
 )
 
 from pipecat_flows import FlowArgs, FlowManager, FlowResult, FlowsFunctionSchema, NodeConfig
-
+from script_pages.page5 import create_page_5_entry_node
 load_dotenv(override=True)
 
 logger.remove(0)
@@ -288,7 +288,8 @@ class FunctionHandlers:
         self.call_flow_state.set_human_detected()
 
         # Send a brief acknowledgment before switching pipelines
-        message = "Hello there! I hear you. How can I help you today?"
+        # This will be the first message in the human conversation
+        message = "Hello there! Am I speaking to Tony?"
         await params.result_callback(message)
 
         # Stop the current pipeline after the response
@@ -793,6 +794,7 @@ async def run_bot(
         task=human_conversation_pipeline_task,
         llm=human_conversation_llm,
         context_aggregator=human_conversation_context_aggregator,
+        transport=transport,
     )
 
     # Update participant left handler for human conversation phase
@@ -810,7 +812,10 @@ async def run_bot(
             # Initialize flow manager first
             await flow_manager.initialize()
             # Then set the initial node
-            await flow_manager.set_node("greeting", create_greeting_node())
+
+            # await flow_manager.set_node("greeting", create_greeting_node())
+            await flow_manager.set_node("greeting", create_page_5_entry_node(flow_manager))
+
             flow_initialized = True
 
     # ------------ RUN HUMAN CONVERSATION PIPELINE WITH FLOWS ------------
