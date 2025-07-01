@@ -10,65 +10,692 @@ import json
 import os
 import sys
 import time
-from typing import Any
-import aiohttp
 
+import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
+from pipecat_flows import FlowArgs, FlowManager, FlowResult, FlowsFunctionSchema, NodeConfig
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
+    CancelFrame,
     EndFrame,
     EndTaskFrame,
+    Frame,
+    FunctionCallInProgressFrame,
+    FunctionCallResultFrame,
     InputAudioRawFrame,
-    StopTaskFrame,
-    TextFrame,
+    StartFrame,
+    StartInterruptionFrame,
+    SystemFrame,
     TranscriptionFrame,
+    TTSSpeakFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
+from pipecat.observers.base_observer import BaseObserver, FramePushed
+from pipecat.pipeline.parallel_pipeline import ParallelPipeline
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.filters.function_filter import FunctionFilter
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.services.cartesia.tts import CartesiaTTSService
-from pipecat.services.cartesia.stt import CartesiaSTTService, CartesiaLiveOptions
-from pipecat.transcriptions.language import Language
-
-from pipecat.services.google.google import GoogleLLMContext
-from pipecat.services.google.llm import GoogleLLMService
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.google.llm import GoogleLLMContext, GoogleLLMService
 from pipecat.services.llm_service import FunctionCallParams
+from pipecat.sync.event_notifier import EventNotifier
 from pipecat.transports.services.daily import (
     DailyParams,
     DailyTransport,
 )
+from pipecatcloud import DailySessionArguments
 
-from pipecat_flows import FlowArgs, FlowManager, FlowResult, FlowsFunctionSchema, NodeConfig
-from script_pages.page5 import create_page_5_entry_node
-from utils.hold_music_manager import HoldMusicManager
+
 load_dotenv(override=True)
 
-logger.remove(0)
+logger.remove()
 logger.add(sys.stderr, level="DEBUG")
 
 daily_api_key = os.getenv("DAILY_API_KEY", "")
 daily_api_url = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
-to_phone_number = os.getenv("TO_PHONE_NUMBER", "")
-partner_phone_number = os.getenv("PARTNER_PHONE_NUMBER", "")
-google_api_key = os.getenv("GOOGLE_API_KEY", "")
+
+use_prebuilt = False
+
+# aiohttp session will be created in async context
 
 
-# ------------ ROOM CREATION FUNCTIONS ------------
+# Simple constants for model states
+VOICEMAIL_MODE = "voicemail"
+HUMAN_MODE = "human"
+MUTE_MODE = "mute"
+
+VOICEMAIL_CONFIDENCE_THRESHOLD = 0.6
+HUMAN_CONFIDENCE_THRESHOLD = 0.6
+
+# ------------ FLOW MANAGER SETUP ------------
 
 
-async def create_room_and_tokens(api_key: str, env: str = "prod") -> tuple[str, str, str]:
+# ------------ PIPECAT FLOWS FOR HUMAN CONVERSATION ------------
+
+
+# Type definitions for flows
+class EndConversationResult(FlowResult):
+    status: str
+
+
+# Flow function handlers
+
+
+async def handle_end_conversation(
+    args: FlowArgs, flow_manager: FlowManager
+) -> tuple[EndConversationResult, str]:
+    """Handle ending the conversation."""
+    logger.debug("handle_end_conversation executing")
+
+    result = EndConversationResult(status="completed")
+
+    # Set up the end node dynamically
+    await flow_manager.set_node("end", create_end_node())
+
+    return result, "end"
+
+
+# Node configurations for human conversation flow
+def create_greeting_node(lead_first_name: str = "the lead") -> NodeConfig:
+    """Create the initial greeting node for human conversation."""
+    return {
+        "name": "greeting",
+        "task_messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a professional customer support agent for educational services. Your responses will be converted to audio, so keep them natural and conversational without special characters or emojis. "
+
+                    "COMPLETE CONVERSATION SCRIPT - Follow this exact sequence to minimize function calls: "
+
+                    f"STEP 1 - IDENTITY VERIFICATION: Start with: 'Hello, may I speak with {lead_first_name}?' "
+
+                    f"STEP 2 - IDENTITY CONFIRMATION: Listen to their response carefully and determine who you are speaking with: "
+
+                    f"OPTION A - IF THEY SAY 'This is {lead_first_name}' or 'Speaking' or 'Yes, this is me': "
+                    "The identity is verified. Proceed directly to STEP 3. "
+
+                    f"OPTION B - IF THEY SAY 'No' or '{lead_first_name} is not here' or 'Wrong number' or 'They're not available': "
+                    f"Say: 'Can you bring {lead_first_name} onto the line?' "
+                    "- IF YES: Say 'Thank you, I'll wait for them.' Wait for the lead to say Hello, then proceed to STEP 3. "
+                    f"- IF NO/NOT AVAILABLE: Say 'I understand. When would be a better time to reach {lead_first_name}?' Then call handle_end_conversation. "
+
+                    f"OPTION C - IF THEY SAY 'I am their parent' or 'I am their guardian' or 'I am their mom/dad' or 'I'm the parent': "
+                    "Say: 'Perfect, I can speak with you as the parent/guardian.' The identity is verified. Proceed to STEP 3. "
+
+                    f"OPTION D - IF UNCLEAR OR CONFUSED: "
+                    f"Say: 'I'm looking for {lead_first_name}. Are you {lead_first_name} or are you their parent or guardian?' Wait for clarification, then follow the appropriate option above. "
+
+                    "STEP 3 - MAIN SCRIPT (Only proceed here after identity is verified in Step 2): "
+                    "Say: 'Hi, this is Kim, a virtual agent and this call may be monitored or recorded for quality purposes. I'm calling to follow up - have you already completed the online enrollment process with us?' "
+
+                    "STEP 4 - RESPOND based on their enrollment status: "
+
+                    "IF ALREADY ENROLLED: Say 'Congratulations and welcome! Our Student Services team will be reaching out shortly to help you get started with your studies. Thank you and have a great day!' Then call handle_end_conversation. "
+
+                    "IF NOT ENROLLED YET: Say 'I'd like to connect you with one of our enrollment specialists who can provide more information and help with the enrollment process. Please hold while I transfer you.' Then call handle_end_conversation. "
+
+                    "IF PREVIOUS CONTACT/CONFUSED: Say 'I apologize for contacting you again. Let me update our records to reflect this conversation. You won't receive any more calls about this. Thank you for your time.' Then call handle_end_conversation. "
+
+                    "IF WANTS TO OPT-OUT: Say 'I completely understand and I'll make sure to update our records immediately so you won't receive any more calls from us. Thank you and I apologize for any inconvenience.' Then call handle_end_conversation. "
+
+                    "IF UNCLEAR/DOESN'T UNDERSTAND: Say 'I apologize for the confusion. This was regarding educational opportunities, but I'll make note of this in our system. Have a great day.' Then call handle_end_conversation. "
+
+                    "CRITICAL RULE: Do NOT proceed to the main script (Step 3) unless you have confirmed you are speaking with either the lead directly OR their parent/guardian. Identity verification must be completed first before discussing enrollment."
+                ),
+            }
+        ],
+        "functions": [
+            FlowsFunctionSchema(
+                name="handle_end_conversation",
+                description="End the conversation after completing the script",
+                properties={},
+                required=[],
+                handler=handle_end_conversation,
+            ),
+        ],
+    }
+
+
+def create_end_node() -> NodeConfig:
+    """Create the final conversation end node."""
+    return {
+        "name": "end",
+        "task_messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Thank the person for the conversation and say goodbye. "
+                    "Keep it brief and friendly."
+                ),
+            }
+        ],
+        "functions": [],  # Required by FlowManager, even if empty
+        "post_actions": [{"type": "end_conversation"}],
+    }
+
+
+# ------------ SIMPLIFIED CLASSES ------------
+
+
+class VoicemailDetectionObserver(BaseObserver):
+    """Observes voicemail speaking patterns to know when voicemail is done."""
+
+    def __init__(self, timeout: float = 5.0):
+        super().__init__()
+        self._processed_frames = set()
+        self._timeout = timeout
+        self._last_turn_time = 0
+        self._voicemail_speaking = False
+
+    async def on_push_frame(self, data: FramePushed):
+        if data.frame.id in self._processed_frames:
+            return
+        self._processed_frames.add(data.frame.id)
+
+        if isinstance(data.frame, UserStartedSpeakingFrame):
+            self._voicemail_speaking = True
+            self._last_turn_time = 0
+        elif isinstance(data.frame, UserStoppedSpeakingFrame):
+            self._last_turn_time = time.time()
+
+    async def wait_for_voicemail(self):
+        """Wait for voicemail to finish speaking."""
+        while self._voicemail_speaking:
+            logger.debug("📩️ Waiting for voicemail to finish")
+            if self._last_turn_time:
+                diff_time = time.time() - self._last_turn_time
+                self._voicemail_speaking = diff_time < self._timeout
+            if self._voicemail_speaking:
+                await asyncio.sleep(0.5)
+
+
+class OutputGate(FrameProcessor):
+    """Simple gate that opens when notified."""
+
+    def __init__(self, notifier, start_open: bool = False):
+        super().__init__()
+        self._gate_open = start_open
+        self._frames_buffer = []
+        self._notifier = notifier
+        self._gate_task = None
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        # Always pass system frames and function call frames
+        if isinstance(
+            frame, (SystemFrame, EndFrame, FunctionCallInProgressFrame,
+                    FunctionCallResultFrame)
+        ):
+            if isinstance(frame, StartFrame):
+                await self._start()
+            elif isinstance(frame, (CancelFrame, EndFrame)):
+                await self._stop()
+            elif isinstance(frame, StartInterruptionFrame):
+                self._frames_buffer = []
+                self._gate_open = False
+            await self.push_frame(frame, direction)
+            return
+
+        # Only gate downstream frames
+        if direction != FrameDirection.DOWNSTREAM:
+            await self.push_frame(frame, direction)
+            return
+
+        if self._gate_open:
+            await self.push_frame(frame, direction)
+        else:
+            # Buffer frames until gate opens
+            self._frames_buffer.append((frame, direction))
+
+    async def _start(self):
+        self._frames_buffer = []
+        if not self._gate_task:
+            self._gate_task = self.create_task(self._gate_task_handler())
+
+    async def _stop(self):
+        if self._gate_task:
+            await self.cancel_task(self._gate_task)
+            self._gate_task = None
+
+    async def _gate_task_handler(self):
+        """Wait for notification to open gate."""
+        while True:
+            try:
+                await self._notifier.wait()
+                self._gate_open = True
+                # Flush buffered frames
+                for frame, direction in self._frames_buffer:
+                    await self.push_frame(frame, direction)
+                self._frames_buffer = []
+                break  # Gate stays open
+            except asyncio.CancelledError:
+                break
+
+
+class UserAudioCollector(FrameProcessor):
+    """Collects audio frames for the LLM context."""
+
+    def __init__(self, context, user_context_aggregator):
+        super().__init__()
+        self._context = context
+        self._user_context_aggregator = user_context_aggregator
+        self._audio_frames = []
+        self._start_secs = 0.2
+        self._user_speaking = False
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame):
+            return
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            self._user_speaking = True
+        elif isinstance(frame, UserStoppedSpeakingFrame):
+            self._user_speaking = False
+            self._context.add_audio_frames_message(
+                audio_frames=self._audio_frames)
+            await self._user_context_aggregator.push_frame(
+                self._user_context_aggregator.get_context_frame()
+            )
+        elif isinstance(frame, InputAudioRawFrame):
+            if self._user_speaking:
+                self._audio_frames.append(frame)
+            else:
+                # Maintain rolling buffer
+                self._audio_frames.append(frame)
+                frame_duration = len(frame.audio) / 16 * \
+                    frame.num_channels / frame.sample_rate
+                buffer_duration = frame_duration * len(self._audio_frames)
+                while buffer_duration > self._start_secs:
+                    self._audio_frames.pop(0)
+                    buffer_duration -= frame_duration
+
+        await self.push_frame(frame, direction)
+
+
+# ------------ MAIN FUNCTION ------------
+
+
+async def run_bot(room_url: str, token: str, body: dict) -> None:
+    """Run the voice bot with parallel pipeline architecture."""
+
+    # ------------ SETUP ------------
+    logger.info(f"Starting bot with room: {room_url}")
+
+    # Create aiohttp session for API calls
+    aiohttp_session = aiohttp.ClientSession()
+
+    body_data = json.loads(body)
+    phone_number = body_data["to_phone_number"]
+    # caller_id = body_data["from_phone_number"]
+    caller_id = ""
+
+    # Extract lead information for use in voicemail messages
+    script_info = body_data.get("scriptInfo", {})
+    lead_first_name = script_info.get("lead_first_name", "there")
+    pf_program = script_info.get("pf_program", "our programs")
+
+    # Simple state tracking
+    current_mode = MUTE_MODE
+    is_voicemail = False
+
+    # Notifier for human conversation gate
+    human_notifier = EventNotifier()
+
+    # Observer for voicemail detection
+    voicemail_observer = VoicemailDetectionObserver()
+
+    # ------------ FUNCTION HANDLERS ------------
+
+    async def voicemail_detected(params: FunctionCallParams):
+        nonlocal current_mode, is_voicemail, lead_first_name, pf_program
+
+        confidence = params.arguments["confidence"]
+        reasoning = params.arguments["reasoning"]
+
+        logger.info(
+            f"Voicemail detected - confidence: {confidence}, reasoning: {reasoning}")
+
+        if confidence >= VOICEMAIL_CONFIDENCE_THRESHOLD and current_mode == MUTE_MODE:
+            current_mode = VOICEMAIL_MODE
+            is_voicemail = True
+
+            await voicemail_observer.wait_for_voicemail()
+
+            # Use lead information directly from parsed body data
+            agent_name = "Kim"
+
+            # Generate  voicemail message
+            message = f"Hello {lead_first_name}, this is {agent_name}, a virtual agent calling to follow up on your request for information about our {pf_program} program. Please call us today at (855) 522-9232 for more info on this program. Thank you, and have a great day."
+            await voicemail_tts.queue_frame(TTSSpeakFrame(text=message))
+            await voicemail_tts.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+
+        await params.result_callback({"confidence": f"{confidence}", "reasoning": reasoning})
+
+    async def human_detected(params: FunctionCallParams):
+        nonlocal current_mode, is_voicemail
+
+        confidence = params.arguments["confidence"]
+        reasoning = params.arguments["reasoning"]
+
+        logger.info(
+            f"Human detected - confidence: {confidence}, reasoning: {reasoning}")
+
+        if confidence >= HUMAN_CONFIDENCE_THRESHOLD and current_mode == MUTE_MODE:
+            current_mode = HUMAN_MODE
+            is_voicemail = False
+
+            await human_notifier.notify()
+            await flow_manager.initialize()
+
+        await params.result_callback({"confidence": f"{confidence}", "reasoning": reasoning})
+
+    # async def terminate_call(params: FunctionCallParams):
+    #     logger.info("Terminating call")
+    #     await asyncio.sleep(3)  # Brief delay before termination
+    #     await params.llm.queue_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+    #     await params.result_callback({"status": "call terminated"})
+
+    # ------------ TRANSPORT & SERVICES ------------
+
+    transport = DailyTransport(
+        room_url,
+        token,
+        "Voicemail Detection Bot",
+        DailyParams(
+            # api_url=daily_api_url,
+            # api_key=daily_api_key,
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            video_out_enabled=False,
+            vad_analyzer=SileroVADAnalyzer(),
+            transcription_enabled=False,
+        ),
+    )
+
+    # TTS services
+    voicemail_tts = CartesiaTTSService(
+        api_key=os.getenv("CARTESIA_API_KEY", ""),
+        voice_id="b7d50908-b17c-442d-ad8d-810c63997ed9",
+    )
+
+    human_tts = CartesiaTTSService(
+        api_key=os.getenv("CARTESIA_API_KEY", ""),
+        voice_id="b7d50908-b17c-442d-ad8d-810c63997ed9",
+    )
+
+    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+
+    # ------------ LLM SETUP ------------
+
+    detection_tools = [
+        {
+            "function_declarations": [
+                {
+                    "name": "voicemail_detected",
+                    "description": "Signals that a voicemail greeting has been detected by the LLM.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "confidence": {
+                                "type": "number",
+                                "description": "The LLM's confidence score (ranging from 0.0 to 1.0) that a voicemail greeting was detected.",
+                            },
+                            "reasoning": {
+                                "type": "string",
+                                "description": "The LLM's textual explanation for why it believes a voicemail was detected, often citing specific phrases from the transcript.",
+                            },
+                        },
+                        "required": ["confidence", "reasoning"],
+                    },
+                },
+                {
+                    "name": "human_detected",
+                    "description": "Signals that a human attempting to communicate has been detected by the LLM.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "confidence": {
+                                "type": "number",
+                                "description": "The LLM's confidence score (ranging from 0.0 to 1.0) that a human conversation has been detected.",
+                            },
+                            "reasoning": {
+                                "type": "string",
+                                "description": "The LLM's textual explanation for why it believes a human communication was detected, often citing specific phrases from the transcript.",
+                            },
+                        },
+                        "required": ["confidence", "reasoning"],
+                    },
+                },
+            ]
+        }
+    ]
+
+    # human_tools = [
+    #     {"function_declarations": [{"name": "terminate_call", "description": "End the call"}]}
+    # ]
+
+    detection_system_instructions = """
+    You are an AI Call Analyzer. Your primary function is to determine if the initial audio from an incoming call is a voicemail system/answering machine or a live human attempting to engage in conversation.
+
+    You will be provided with a transcript of the first few seconds of an audio interaction.
+
+    Based on your analysis of this transcript, you MUST decide to call ONE of the following two functions:
+
+    1.  voicemail_detected
+        *   Call this function if the transcript strongly indicates a pre-recorded voicemail greeting, an answering machine message, or instructions to leave a message.
+        *   Keywords and phrases to look for: "you've reached," "not available," "leave a message," "at the tone/beep," "sorry I missed your call," "please leave your name and number."
+        *   Also consider if the speech sounds like a monologue without expecting an immediate response.
+        *   Keep in mind that the beep noise from a typical pre-recorded voicemail greeting comes after the greeting and not before.
+
+    2.  human_detected
+        *   Call this function if the transcript indicates a human is present and actively trying to communicate or expecting an immediate response.
+        *   Keywords and phrases to look for: "Hello?", "Hi," "[Company Name], how can I help you?", "Speaking.", or any direct question aimed at initiating a dialogue.
+        *   Consider if the speech sounds like the beginning of a two-way conversation.
+
+    **Decision Guidelines:**
+
+    *   **Prioritize Human:** If there's ambiguity but a slight indication of a human trying to speak (e.g., a simple "Hello?" followed by a pause, which could be either), err on the side of `human_detected` to avoid missing a live interaction. Only call `voicemail_detected` if there are clear, strong indicators of a voicemail system.
+    *   **Focus on Intent:** Is the speaker *delivering information* (likely voicemail) or *seeking interaction* (likely human)?
+    *   **Brevity:** Voicemail greetings are often concise and formulaic. Human openings can be more varied."""
+
+    detection_llm = GoogleLLMService(
+        model="models/gemini-2.0-flash-lite",
+        api_key=os.getenv("GOOGLE_API_KEY"),
+        system_instruction=detection_system_instructions,
+        tools=detection_tools,
+    )
+
+    human_llm = GoogleLLMService(
+        model="models/gemini-2.5-flash",
+        api_key=os.getenv("GOOGLE_API_KEY"),
+        # system_instruction="""You are Chatbot talking to a human. Be friendly and helpful.
+        # Start with: "Hello! I'm a friendly chatbot. How can I help you today?"
+        # Keep your responses brief and to the point. Listen to what the person says.
+        # If the user asks you to check the context, call the function `context_check`.
+        # When the person indicates they're done with the conversation by saying something like:
+        # - "Goodbye"
+        # - "That's all"
+        # - "I'm done"
+        # - "Thank you, that's all I needed"
+        # THEN say: "Thank you for chatting. Goodbye!" and call the terminate_call function.""",
+        # tools=human_tools,
+    )
+
+    # ------------ CONTEXTS & FUNCTIONS ------------
+
+    # context = GoogleLLMContext()
+    # context_aggregator = detection_llm.create_context_aggregator(context)
+
+    detection_context = GoogleLLMContext()
+    detection_context_aggregator = detection_llm.create_context_aggregator(
+        detection_context)
+
+    human_context = GoogleLLMContext()
+    human_context_aggregator = human_llm.create_context_aggregator(
+        human_context)
+
+    # Register functions
+    detection_llm.register_function("voicemail_detected", voicemail_detected)
+    detection_llm.register_function("human_detected", human_detected)
+    # human_llm.register_function("terminate_call", terminate_call)
+
+    # ------------ PROCESSORS ------------
+
+    audio_collector = UserAudioCollector(
+        detection_context, detection_context_aggregator.user())
+    human_gate = OutputGate(human_notifier, start_open=False)
+
+    # Filter functions
+    async def voicemail_filter(frame) -> bool:
+        return current_mode == VOICEMAIL_MODE
+
+    async def human_filter(frame) -> bool:
+        return current_mode == HUMAN_MODE
+
+    # ------------ PIPELINE ------------
+
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            ParallelPipeline(
+                # Voicemail detection branch
+                [
+                    audio_collector,
+                    detection_context_aggregator.user(),
+                    detection_llm,
+                    voicemail_tts,
+                    FunctionFilter(voicemail_filter),
+                ],
+                # Human conversation branch
+                [
+                    stt,
+                    human_context_aggregator.user(),
+                    human_llm,
+                    human_gate,
+                    human_tts,
+                    FunctionFilter(human_filter),
+                    human_context_aggregator.assistant(),
+                ],
+            ),
+            transport.output(),
+        ]
+    )
+
+    pipeline_task = PipelineTask(
+        pipeline,
+        idle_timeout_secs=90,
+        params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+        cancel_on_idle_timeout=False,
+        observers=[voicemail_observer],
+    )
+
+    flow_manager = FlowManager(
+        task=pipeline_task,
+        tts=human_tts,
+        llm=human_llm,
+        context_aggregator=human_context_aggregator,
+        transport=transport,
+    )
+
+    # Initialize flow manager state with all necessary data
+    flow_manager.state.update({
+        "bot_name": "Kim",
+        "escalation_number": body_data.get("escalation_number"),
+        "partner_phone_number": body_data.get("partner_phone_number"),
+        "session_id": body_data.get("session_id"),
+        "from_phone_number": body_data.get("from_phone_number"),
+        "to_phone_number": phone_number,
+        "daily_room_url": body_data.get("daily_room_url"),
+        "music_token": body_data.get("music_token"),
+        "lead_id": body_data.get("lead_id"),
+        "program_id": body_data.get("program_id"),
+        "event_log_id": body_data.get("event_log_id"),
+        # Script Info
+        "lead_first_name": lead_first_name,
+        "lead_state": script_info.get("lead_state"),
+        "pf_program": pf_program,
+    })
+
+    # ------------ EVENT HANDLERS ------------
+
+    @transport.event_handler("on_joined")
+    async def on_joined(transport, data):
+        if not use_prebuilt:
+            dialout_params = {"phoneNumber": phone_number}
+            if caller_id:
+                dialout_params["callerId"] = caller_id
+            logger.info(
+                f"Dialing out to {phone_number} with caller ID {caller_id}")
+            await transport.start_dialout(dialout_params)
+
+    @transport.event_handler("on_dialout_answered")
+    async def on_dialout_answered(transport, data):
+        logger.debug(f"Call answered: {data}")
+        await transport.capture_participant_transcription(data["sessionId"])
+
+    @transport.event_handler("on_dialout_error")
+    async def on_dialout_error(transport, data):
+        logger.error(f"Dialout error: {data}")
+        await pipeline_task.queue_frame(EndFrame())
+
+    @transport.event_handler("on_participant_left")
+    async def on_participant_left(transport, participant, reason):
+        await pipeline_task.queue_frame(EndFrame())
+
+    # Remove the problematic on_pipeline_started handler
+    # The context will be initialized naturally when frames flow through the pipeline
+
+    # ------------ RUN ------------
+
+    runner = PipelineRunner()
+    logger.info("Starting simplified parallel pipeline bot")
+
+    try:
+        await runner.run(pipeline_task)
+    except Exception as e:
+        logger.error(f"Pipeline error: {e}")
+        import traceback
+
+        logger.error(traceback.format_exc())
+    finally:
+        await aiohttp_session.close()
+
+
+# ------------ ENTRY POINT ------------
+
+async def bot(args: DailySessionArguments) -> None:
+    """Main Entry point for Pipecat Cloud Bot"""
+    args_body = args.body
+    await run_bot(args_body["daily_room_url"],
+                  args_body["bot_token"], json.dumps(args_body))
+    # session_id
+    # daily_room_url
+    # event_log_id
+    # lead_id
+    # program_id
+    # bot_token
+    # music_token
+    # from_phone_number
+    # to_phone_number
+    # scriptInfo {}
+    # escalation_number
+    # partner_phone_number
+
+
+async def create_room_and_tokens(api_key: str) -> tuple[str, str, str]:
     """Create a Daily room and generate bot and music tokens.
 
     Args:
         api_key: Daily API key
-        env: Environment (prod or dev, affects API URL)
 
     Returns:
         Tuple of (room_url, bot_token, music_token)
@@ -76,11 +703,7 @@ async def create_room_and_tokens(api_key: str, env: str = "prod") -> tuple[str, 
     if not api_key:
         raise ValueError("Daily API key is required")
 
-    # Set API URL based on environment
-    if env == "dev":
-        api_url = "https://api.daily.co/v1"  # You can modify this for dev environment
-    else:
-        api_url = daily_api_url
+    api_url = "https://api.daily.co/v1"
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -155,1023 +778,36 @@ async def create_room_and_tokens(api_key: str, env: str = "prod") -> tuple[str, 
     return room_url, bot_token, music_token
 
 
-# ------------ HELPER CLASSES ------------
-
-
-class CallFlowState:
-    """State for tracking call flow operations and state transitions."""
-
-    def __init__(self):
-        # Voicemail detection state
-        self.voicemail_detected = False
-        self.human_detected = False
-
-        # Call termination state
-        self.call_terminated = False
-        self.participant_left_early = False
-
-    # Voicemail detection methods
-    def set_voicemail_detected(self):
-        """Mark that a voicemail system has been detected."""
-        self.voicemail_detected = True
-        self.human_detected = False
-
-    def set_human_detected(self):
-        """Mark that a human has been detected (not voicemail)."""
-        self.human_detected = True
-        self.voicemail_detected = False
-
-    # Call termination methods
-    def set_call_terminated(self):
-        """Mark that the call has been terminated by the bot."""
-        self.call_terminated = True
-
-    def set_participant_left_early(self):
-        """Mark that a participant left the call early."""
-        self.participant_left_early = True
-
-
-class UserAudioCollector(FrameProcessor):
-    """Collects audio frames in a buffer, then adds them to the LLM context when the user stops speaking."""
-
-    def __init__(self, context, user_context_aggregator):
-        super().__init__()
-        self._context = context
-        self._user_context_aggregator = user_context_aggregator
-        self._audio_frames = []
-        # Increase pre-buffer to 0.3s for better first-word capture
-        self._start_secs = 0.3
-        self._user_speaking = False
-
-    async def process_frame(self, frame, direction):
-        await super().process_frame(frame, direction)
-
-        if isinstance(frame, TranscriptionFrame):
-            # Skip transcription frames - we're handling audio directly
-            return
-        elif isinstance(frame, UserStartedSpeakingFrame):
-            self._user_speaking = True
-        elif isinstance(frame, UserStoppedSpeakingFrame):
-            self._user_speaking = False
-            self._context.add_audio_frames_message(
-                audio_frames=self._audio_frames)
-            await self._user_context_aggregator.push_frame(
-                self._user_context_aggregator.get_context_frame()
-            )
-        elif isinstance(frame, InputAudioRawFrame):
-            if self._user_speaking:
-                # When speaking, collect frames
-                self._audio_frames.append(frame)
-            else:
-                # Maintain a rolling buffer of recent audio (for start of speech)
-                self._audio_frames.append(frame)
-                frame_duration = len(frame.audio) / 16 * \
-                    frame.num_channels / frame.sample_rate
-                buffer_duration = frame_duration * len(self._audio_frames)
-                while buffer_duration > self._start_secs:
-                    self._audio_frames.pop(0)
-                    buffer_duration -= frame_duration
-
-        await self.push_frame(frame, direction)
-
-
-class FunctionHandlers:
-    """Handlers for the voicemail detection bot functions."""
-
-    def __init__(self, call_flow_state: CallFlowState):
-        self.call_flow_state = call_flow_state
-
-    async def voicemail_response(self, params: FunctionCallParams):
-        """Function the bot can call to leave a voicemail message."""
-        message = "Say this message exactly: 'Hello, this is a message for Pipecat example user. This is Chatbot. Please call back on 123-456-7891. Thank you.' After saying this message, immediately call the terminate_call function."
-
-        # Update state to indicate voicemail was detected
-        self.call_flow_state.set_voicemail_detected()
-
-        await params.result_callback(message)
-
-    async def human_conversation(self, params: FunctionCallParams):
-        """Function called when bot detects it's talking to a human."""
-        # Update state to indicate human was detected
-        self.call_flow_state.set_human_detected()
-
-        # Send a brief acknowledgment before switching pipelines
-        # This will be the first message in the human conversation
-        message = "Hello there! Am I speaking to Tony?"
-        await params.result_callback(message)
-
-        # Stop the current pipeline after the response
-        await params.llm.push_frame(StopTaskFrame(), FrameDirection.UPSTREAM)
-
-
-# ------------ PIPECAT FLOWS FOR HUMAN CONVERSATION ------------
-
-
-# Type definitions for flows
-class GreetingResult(FlowResult):
-    greeting_complete: bool
-
-
-class ConversationResult(FlowResult):
-    message: str
-
-
-class EndConversationResult(FlowResult):
-    status: str
-
-
-# Flow function handlers
-async def handle_greeting(
-    args: FlowArgs, flow_manager: FlowManager
-) -> tuple[GreetingResult, str]:
-    """Handle initial greeting to human."""
-    logger.debug("handle_greeting executing")
-
-    result = GreetingResult(greeting_complete=True)
-
-    # Set up the conversation node dynamically
-    await flow_manager.set_node("conversation", create_conversation_node())
-
-    return result, "conversation"
-
-
-async def handle_conversation(
-    args: FlowArgs, flow_manager: FlowManager
-) -> tuple[ConversationResult, str]:
-    """Handle ongoing conversation with human."""
-    message = args.get("message", "")
-    logger.debug(f"handle_conversation executing with message: {message}")
-
-    result = ConversationResult(message=message)
-
-    # Continue with the same conversation node for ongoing chat
-    return result, "conversation"
-
-
-async def handle_end_conversation(
-    args: FlowArgs, flow_manager: FlowManager
-) -> tuple[EndConversationResult, str]:
-    """Handle ending the conversation."""
-    logger.debug("handle_end_conversation executing")
-
-    result = EndConversationResult(status="completed")
-
-    # Set up the end node dynamically
-    await flow_manager.set_node("end", create_end_node())
-
-    return result, "end"
-
-
-# Node configurations for human conversation flow
-def create_greeting_node() -> NodeConfig:
-    """Create the initial greeting node for human conversation."""
-    return {
-        "name": "greeting",
-        "role_messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a friendly chatbot. Your responses will be "
-                    "converted to audio, so avoid special characters. "
-                    "Be conversational and helpful."
-                ),
-            }
-        ],
-        "task_messages": [
-            {
-                "role": "system",
-                "content": (
-                    "The user has been detected as a human (not a voicemail system). "
-                    "Respond naturally to what they say. Listen to their input and respond appropriately. "
-                    "If they seem to be greeting you or asking if someone is there, greet them warmly. "
-                    "After responding to their input, call handle_greeting to proceed to the main conversation."
-                ),
-            }
-        ],
-        "functions": [
-            FlowsFunctionSchema(
-                name="handle_greeting",
-                description="Mark that greeting is complete and proceed to conversation",
-                properties={},
-                required=[],
-                handler=handle_greeting,
-            )
-        ],
+async def run_local_test() -> None:
+    """Run a local test of the bot."""
+    # Create a room
+    room_url, bot_token, music_token = await create_room_and_tokens(daily_api_key)
+    # Create a test body
+    mock_body = {
+        "daily_room_url": room_url,
+        "bot_token": bot_token,
+        "music_token": music_token,
+        "session_id": "test-session",
+        "event_log_id": 1234,
+        "lead_id": 12345,
+        "program_id": 67890,
+        "from_phone_number": os.getenv("FROM_PHONE_NUMBER"),
+        "to_phone_number": os.getenv("TO_PHONE_NUMBER"),
+        "scriptInfo": {
+            "lead_first_name": "John",
+            "lead_state": "California",
+            "pf_program": "High School",
+        },
+        "escalation_number": os.getenv("ESCALATION_NUMBER"),
+        "partner_phone_number": os.getenv("PARTNER_PHONE_NUMBER"),
     }
 
-
-def create_conversation_node() -> NodeConfig:
-    """Create the main conversation node."""
-    return {
-        "name": "conversation",
-        "task_messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are having a friendly conversation with a human. "
-                    "Listen to what they say and respond helpfully. "
-                    "Keep your responses brief and conversational. "
-                    "If they indicate they want to end the conversation (saying goodbye, "
-                    "thanks, that's all, etc.), call handle_end_conversation. "
-                    "Otherwise, use handle_conversation to continue the chat."
-                ),
-            }
-        ],
-        "functions": [
-            FlowsFunctionSchema(
-                name="handle_conversation",
-                description="Continue the conversation with the human",
-                properties={
-                    "message": {"type": "string", "description": "The response message"}
-                },
-                required=["message"],
-                handler=handle_conversation,
-            ),
-            FlowsFunctionSchema(
-                name="handle_end_conversation",
-                description="End the conversation when the human is ready to finish",
-                properties={},
-                required=[],
-                handler=handle_end_conversation,
-            ),
-        ],
-    }
-
-
-def create_end_node() -> NodeConfig:
-    """Create the final conversation end node."""
-    return {
-        "name": "end",
-        "task_messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Thank the person for the conversation and say goodbye. "
-                    "Keep it brief and friendly."
-                ),
-            }
-        ],
-        "functions": [],  # Required by FlowManager, even if empty
-        "post_actions": [{"type": "end_conversation"}],
-    }
-
-
-# ------------ MAIN FUNCTION ------------
-
-
-async def run_bot(
-    room_url: str,
-    token: str,
-    body: dict,
-    music_token: str = None,
-) -> None:
-    """Run the voice bot with the given parameters.
-
-    Args:
-        room_url: The Daily room URL
-        token: The Daily room token
-        body: Body passed to the bot from the webhook
-        music_token: The Daily music token (optional)
-
-    """
-    # ------------ CONFIGURATION AND SETUP ------------
-    # Store participant ID to transfer to flow_manager.state later
-    consumer_participant_id = None
-
-    logger.info(f"Starting bot with room: {room_url}")
-    logger.info(f"Token: {token}")
-    logger.info(f"Body: {body}")
-    # Parse the body to get the dial-in settings
-    body_data = json.loads(body)
-
-    # Check if the body contains dial-in settings
-    logger.debug(f"Body data: {body_data}")
-
-    if not body_data.get("dialout_settings"):
-        logger.error("Dial-out settings not found in the body data")
-        return
-
-    dialout_settings = body_data["dialout_settings"]
-
-    if not dialout_settings.get("phone_number"):
-        logger.error(
-            "Dial-out phone number not found in the dial-out settings")
-        return
-
-    # Extract dial-out phone number
-    phone_number = dialout_settings["phone_number"]
-    # Use .get() to handle optional field
-    caller_id = dialout_settings.get("caller_id")
-
-    if caller_id:
-        logger.info(f"Dial-out caller ID specified: {caller_id}")
-    else:
-        logger.info("Dial-out caller ID not specified; proceeding without it")
-
-    # ------------ TRANSPORT SETUP ------------
-
-    transport = DailyTransport(
+    await run_bot(
         room_url=room_url,
-        token=token,
-        bot_name=f"CA_Aged Bot",
-        params=DailyParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(
-                sample_rate=16000,      # Match the TTS sample rate
-                params=VADParams(
-                    confidence=0.5,         # Lower for more sensitivity
-                    start_secs=0.1,         # Faster trigger
-                    stop_secs=0.7,          # Unchanged
-                    min_volume=0.5          # Unchanged
-                )
-            )
-        )
-
+        token=bot_token,
+        body=json.dumps(mock_body)
     )
-    # Initialize TTS with optimized settings for clarity
-    tts = CartesiaTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY", ""),
-        voice_id="6f84f4b8-58a2-430c-8c79-688dad597532",  # Helpful Woman voice
-        sample_rate=16000,  # Standard sample rate that matches input
-    )
-
-    # Initialize speech-to-text service (for human conversation phase)
-    stt = CartesiaSTTService(
-        api_key=os.getenv("CARTESIA_API_KEY", ""),
-        live_options=CartesiaLiveOptions(
-            model="ink-whisper", language=Language.EN.value,     sample_rate=16000,
-            encoding="pcm_s16le")
-    )
-
-    # ------------ FUNCTION DEFINITIONS ------------
-
-    async def terminate_call(
-        params: FunctionCallParams,
-        call_flow_state: CallFlowState = None,
-    ):
-        """Function the bot can call to terminate the call."""
-        if call_flow_state:
-            # Set call terminated flag in the session manager
-            call_flow_state.set_call_terminated()
-
-        await params.llm.queue_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
-
-    # ------------ VOICEMAIL DETECTION PHASE SETUP ------------
-
-    # Define tools for both LLMs
-    tools = [
-        {
-            "function_declarations": [
-                {
-                    "name": "switch_to_voicemail_response",
-                    "description": "Call this function when you detect this is a voicemail system.",
-                },
-                {
-                    "name": "switch_to_human_conversation",
-                    "description": "Call this function when you detect this is a human.",
-                },
-                {
-                    "name": "terminate_call",
-                    "description": "Call this function to terminate the call.",
-                },
-            ]
-        }
-    ]
-
-    system_instruction = """You are Chatbot trying to determine if this is a voicemail system or a human. Make this decision QUICKLY based on the first audio you hear.
-
-        VOICEMAIL INDICATORS - Call switch_to_voicemail_response if you hear:
-        - "Please leave a message after the beep"
-        - "No one is available to take your call"
-        - "Record your message after the tone"
-        - "You have reached voicemail for..."
-        - "You have reached [phone number]"
-        - "[phone number] is unavailable"
-        - "The person you are trying to reach..."
-        - "The number you have dialed..."
-        - "Your call has been forwarded to an automated voice messaging system"
-        - "Has been forwarded to voice mail"
-        - "At the tone"
-        - Any robotic/automated voice with formal phrasing
-
-        HUMAN INDICATORS - Call switch_to_human_conversation if you hear:
-        - "Hello" or "Hello?"
-        - "Hi" or "Hey"
-        - "Is anyone there?"
-        - Natural conversational tone
-        - Questions directed at you
-        - Informal speech patterns
-
-        BE DECISIVE: If you hear "Hello?" or "Hello? Is anyone there?" - this is clearly a HUMAN, call switch_to_human_conversation IMMEDIATELY.
-
-        DO NOT say anything until you've determined if this is a voicemail or human.
-
-        When you detect a voicemail system, call switch_to_voicemail_response and then say EXACTLY what the function response tells you to say.
-
-        When you detect a human, call switch_to_human_conversation and then say EXACTLY what the function response tells you to say.
-
-        When a function returns a message for you to say, you MUST say that exact message. Do not refuse to speak or say you cannot speak.
-
-        Only call the terminate_call function when explicitly instructed to do so by a function response or if there's an error."""
-
-    # Initialize voicemail detection LLM
-    voicemail_detection_llm = GoogleLLMService(
-        model="models/gemini-2.5-flash-lite-preview-06-17",
-        api_key=google_api_key,
-        system_instruction=system_instruction,
-        tools=tools,
-    )
-
-    # Initialize context and context aggregator
-    voicemail_detection_context = GoogleLLMContext()
-
-    voicemail_detection_context_aggregator = voicemail_detection_llm.create_context_aggregator(
-        voicemail_detection_context
-    )
-
-    # Set up function handlers
-    call_flow_state = CallFlowState()
-    handlers = FunctionHandlers(call_flow_state)
-
-    # Register functions with the voicemail detection LLM
-    voicemail_detection_llm.register_function(
-        "switch_to_voicemail_response",
-        handlers.voicemail_response,
-    )
-    voicemail_detection_llm.register_function(
-        "switch_to_human_conversation", handlers.human_conversation
-    )
-    voicemail_detection_llm.register_function(
-        "terminate_call", lambda params: terminate_call(
-            params, call_flow_state)
-    )
-
-    # Set up audio collector for handling audio input
-    voicemail_detection_audio_collector = UserAudioCollector(
-        voicemail_detection_context, voicemail_detection_context_aggregator.user()
-    )
-
-    # Build voicemail detection pipeline
-    voicemail_detection_pipeline = Pipeline(
-        [
-            transport.input(),  # Transport user input
-            voicemail_detection_audio_collector,  # Collect audio frames
-            voicemail_detection_context_aggregator.user(),  # User context
-            voicemail_detection_llm,  # LLM
-            tts,  # TTS
-            transport.output(),  # Transport bot output
-            voicemail_detection_context_aggregator.assistant(),  # Assistant context
-        ]
-    )
-
-    # Create pipeline task
-    voicemail_detection_pipeline_task = PipelineTask(
-        voicemail_detection_pipeline,
-        params=PipelineParams(allow_interruptions=True),
-    )
-
-    # ------------ RETRY LOGIC VARIABLES ------------
-    max_retries = 5
-    retry_count = 0
-    dialout_successful = False
-
-    # Build dialout parameters conditionally
-    dialout_params = {"phoneNumber": phone_number,
-                      "displayName": "consumer",
-                      "userId": "consumer",
-                      "permissions": {
-                          "canReceive": {
-                              "base": False,
-                              "byUserId": {
-                                  "bot": True
-                              }
-                          }}}
-    if caller_id:
-        dialout_params["callerId"] = caller_id
-        logger.debug(f"Including caller ID in dialout: {caller_id}")
-
-    logger.debug(f"Dialout parameters: {dialout_params}")
-
-    async def attempt_dialout():
-        """Attempt to start dialout with retry logic."""
-        nonlocal retry_count, dialout_successful
-
-        if retry_count < max_retries and not dialout_successful:
-            retry_count += 1
-            logger.info(
-                f"Attempting dialout (attempt {retry_count}/{max_retries}) to: {phone_number}"
-            )
-            await transport.start_dialout(dialout_params)
-        else:
-            logger.error(
-                f"Maximum retry attempts ({max_retries}) reached. Giving up on dialout.")
-
-    # ------------ EVENT HANDLERS ------------
-
-    @transport.event_handler("on_joined")
-    async def on_joined(transport, data):
-        # Start initial dialout attempt with a small delay to ensure full initialization
-        logger.debug(
-            f"Dialout settings detected; starting dialout to number: {phone_number}")
-        await asyncio.sleep(1.0)  # Give the bot time to fully join
-        await attempt_dialout()
-
-    @transport.event_handler("on_dialout_connected")
-    async def on_dialout_connected(transport, data):
-        logger.debug(f"Dial-out connected: {data}")
-
-    @transport.event_handler("on_dialout_answered")
-    # Renamed arg to avoid confusion
-    async def on_dialout_answered(transport, participant_data):
-        nonlocal dialout_successful
-        logger.debug(f"Initial consumer dial-out answered: {participant_data}")
-        dialout_successful = True  # Mark as successful to stop retries
-
-        consumer_session_id = participant_data.get("sessionId")
-
-        if consumer_session_id:
-            logger.info(
-                f"Consumer answered (session ID: {consumer_session_id}). Starting transcription capture.")
-            # Automatically start capturing transcription for the consumer
-            await transport.capture_participant_transcription(consumer_session_id)
-        else:
-            logger.warning(
-                "Consumer dial-out answered event received without participant sessionId.")
-
-    @transport.event_handler("on_dialout_error")
-    async def on_dialout_error(transport, data):
-        logger.error(
-            f"Dial-out error (attempt {retry_count}/{max_retries}): {data}")
-
-        if retry_count < max_retries:
-            logger.info(f"Retrying dialout")
-            await attempt_dialout()
-        else:
-            logger.error(
-                f"All {max_retries} dialout attempts failed. Stopping bot.")
-            await voicemail_detection_pipeline_task.queue_frame(EndFrame())
-
-    @transport.event_handler("on_first_participant_joined")
-    async def on_first_participant_joined(transport, participant):
-        nonlocal consumer_participant_id
-        logger.debug(f"First participant joined: {participant['id']}")
-        consumer_participant_id = participant["id"]
-
-    @transport.event_handler("on_participant_left")
-    async def on_participant_left(transport, participant, reason):
-        # Mark that a participant left early
-        call_flow_state.set_participant_left_early()
-        await voicemail_detection_pipeline_task.queue_frame(EndFrame())
-
-    # ------------ RUN VOICEMAIL DETECTION PIPELINE ------------
-
-    runner = PipelineRunner()
-
-    print("!!! starting voicemail detection pipeline")
-    try:
-        await runner.run(voicemail_detection_pipeline_task)
-    except Exception as e:
-        logger.error(f"Error in voicemail detection pipeline: {e}")
-        import traceback
-
-        logger.error(traceback.format_exc())
-    print("!!! Done with voicemail detection pipeline")
-
-    # Check if we should exit early
-    if call_flow_state.participant_left_early or call_flow_state.call_terminated:
-        if call_flow_state.participant_left_early:
-            print("!!! Participant left early; terminating call")
-        elif call_flow_state.call_terminated:
-            print("!!! Bot terminated call; not proceeding to human conversation")
-        return
-
-    # ------------ HUMAN CONVERSATION PHASE SETUP (FLOWS-BASED) ------------
-
-    # Add a small delay to ensure the voicemail detection pipeline has fully stopped
-    await asyncio.sleep(0.5)
-
-    print("!!! starting human conversation pipeline with flows")
-
-    # Initialize human conversation LLM for flows
-    human_conversation_llm = GoogleLLMService(
-        model="models/gemini-2.5-flash",  # Full model for better conversation
-        api_key=google_api_key,
-    )
-
-    # Initialize context and context aggregator for flows - use GoogleLLMContext for GoogleLLMService
-    # human_conversation_context = GoogleLLMContext()
-    # TODO: This was identified as a bug previously, should be GoogleLLMContext
-    human_conversation_context = OpenAILLMContext()
-    human_conversation_context_aggregator = human_conversation_llm.create_context_aggregator(
-        human_conversation_context
-    )
-
-    # Clear any lingering transcription state in the transport
-    # This prevents old audio/transcription from interfering with the new pipeline
-    # await transport.stop_transcription()
-    # await transport.start_transcription()
-
-    # Build human conversation pipeline for flows
-    human_conversation_pipeline = Pipeline(
-        [
-            transport.input(),  # Transport user input
-            stt,  # Speech-to-text
-            human_conversation_context_aggregator.user(),  # User context
-            human_conversation_llm,  # LLM
-            tts,  # TTS
-            transport.output(),  # Transport bot output
-            human_conversation_context_aggregator.assistant(),  # Assistant context
-        ]
-    )
-
-    # Create pipeline task
-    human_conversation_pipeline_task = PipelineTask(
-        human_conversation_pipeline,
-        params=PipelineParams(allow_interruptions=True),
-    )
-
-    # Initialize flow manager
-    flow_manager = FlowManager(
-        task=human_conversation_pipeline_task,
-        llm=human_conversation_llm,
-        context_aggregator=human_conversation_context_aggregator,
-        transport=transport,
-    )
-
-    # Transfer stored participant ID to flow_manager.state
-    if consumer_participant_id:
-        flow_manager.state["consumer_participant_id"] = consumer_participant_id
-        logger.debug(
-            f"Transferred participant ID to flow_manager.state: {consumer_participant_id}")
-
-    # Store the phone number in flow_manager.state
-    flow_manager.state["to_phone_number"] = phone_number
-    logger.debug(f"Stored phone number in flow_manager.state: {phone_number}")
-
-    # Store the partner phone number in flow_manager.state
-    flow_manager.state["partner_phone_number"] = partner_phone_number
-    logger.debug(
-        f"Stored partner phone number in flow_manager.state: {partner_phone_number}")
-
-    # Store the music token in flow_manager.state
-    flow_manager.state["music_token"] = music_token
-    logger.debug(
-        f"Stored music token in flow_manager.state: {music_token[:10]}...")
-
-    # Store the room URL in flow_manager.state
-    flow_manager.state["daily_room_url"] = room_url
-    logger.debug(f"Stored room URL in flow_manager.state: {room_url}")
-
-    # Store the hold music manager in flow_manager.state
-    flow_manager.state["hold_music_manager"] = HoldMusicManager()
-    logger.debug("Stored hold music manager in flow_manager.state")
-
-    # Re-register event handlers for the human conversation phase, now with access to flow_manager
-
-    @transport.event_handler("on_dialout_answered")
-    # transport_obj to avoid conflict
-    async def on_partner_dialout_answered(transport_obj, participant):
-        logger.debug(f"Partner dial-out answered: {participant}")
-        # This handler is now specific to partner dialout, as the initial consumer dialout
-        # is handled by the on_dialout_answered defined before the human pipeline.
-
-        initiate_transfer = flow_manager.state.get("initate_transfer", False)
-        participant_id = participant.get("sessionId")
-
-        if not participant_id:
-            logger.error(
-                "Partner dial-out answered event received without participant sessionId.")
-            return
-
-        # Store partner participant ID
-        flow_manager.state["partner_participant_id"] = participant_id
-        logger.info(f"Partner participant ID set to: {participant_id}")
-
-        # Automatically start capturing transcription for the partner
-        await transport_obj.capture_participant_transcription(participant_id)
-        logger.info(
-            f"Started transcription capture for partner: {participant_id}")
-
-        try:
-            if initiate_transfer:
-                # Stop hold music as partner has answered
-                hold_music_manager = flow_manager.state.get(
-                    "hold_music_manager")
-                if hold_music_manager:
-                    logger.info("Partner answered, stopping hold music.")
-                    await hold_music_manager.stop()
-                    # We might want to pop this from state if page 6 doesn't handle its own cleanup
-                    # flow_manager.state.pop("hold_music_manager", None)
-
-                if flow_manager.state.get("consumer_hung_up"):
-                    logger.info(
-                        "Consumer hung up before partner answered or during transfer. Transitioning to page 24.")
-                    from script_pages.page24 import create_page_24_entry_node
-                    page_24_node_config = create_page_24_entry_node(
-                        flow_manager)
-                    await flow_manager.set_node("create_page_24_entry_node", page_24_node_config)
-                    logger.info("Successfully set node to page 24.")
-                else:
-                    logger.info(
-                        "Partner answered and consumer still present. Transitioning to page 6.")
-                    from script_pages.page6 import create_page_6_entry_node
-                    page_6_node_config = create_page_6_entry_node(flow_manager)
-                    await flow_manager.set_node("create_page_6_entry_node", page_6_node_config)
-                    logger.info("Successfully set node to page 6.")
-            else:
-                logger.warning(
-                    "Partner dial-out answered, but 'initiate_transfer' was false. No transition.")
-        except Exception as e:
-            logger.error(
-                f"Error in on_partner_dialout_answered during transition: {e}", exc_info=True)
-
-    @transport.event_handler("on_dialout_error")
-    # transport_obj to avoid conflict
-    async def on_partner_dialout_error(transport_obj, data):
-        # This handler is now specific to partner dialout
-        logger.error(f"Partner dial-out error: {data}")
-        # Potentially add logic here to inform the consumer or try an alternative partner.
-        # For now, it just logs. If page 5 initiated this, its logic might handle retries or alternative paths.
-        # Consider if we need to transition to a specific "transfer_failed" page.
-        current_node_name = flow_manager.state.get("current_node_name", "")
-        # Check if page 5 is active
-        if current_node_name.startswith("page_5_"):
-            logger.info(
-                "Partner dialout error occurred while on Page 5. Page 5 logic should handle this.")
-            # Page 5 might have its own retry logic or decide to inform the user.
-            # We could also push a specific event or update state for Page 5 to react to.
-            # Signal to Page 5
-            flow_manager.state["partner_dialout_failed"] = True
-            # Example: Trigger a custom event for Page 5 if it's designed to listen
-            # await flow_manager.process_event({"type": "partner_dialout_failed", "data": data})
-
-            # If consumer is still on the line, stop hold music and potentially inform them.
-            if not flow_manager.state.get("consumer_hung_up"):
-                hold_music_manager = flow_manager.state.get(
-                    "hold_music_manager")
-                if hold_music_manager and hold_music_manager.is_playing():
-                    logger.info(
-                        "Stopping hold music due to partner dialout error.")
-                    await hold_music_manager.stop()
-
-                # Transition to a node that informs the user about the failure
-                # This is a placeholder, actual node might be different or part of Page 5's error handling
-                from script_pages.page5 import create_page_5_transfer_failed_node
-                transfer_failed_node = create_page_5_transfer_failed_node(
-                    flow_manager)
-                if transfer_failed_node:
-                    logger.info(
-                        "Transitioning to transfer failed node on Page 5.")
-                    await flow_manager.set_node("page_5_transfer_failed_node", transfer_failed_node)
-                else:
-                    logger.warning(
-                        "Transfer failed node not defined in page5.py. Cannot transition.")
-
-        else:
-            logger.warning(
-                f"Partner dialout error, but not on Page 5 (current: {current_node_name}). No specific action defined.")
-
-    # Update participant left handler for human conversation phase
-
-    @transport.event_handler("on_participant_left")
-    # transport_obj to avoid conflict
-    async def on_participant_left_human_phase(transport_obj, participant, reason):
-        participant_id = participant.get("id")
-        # Use userId for more reliable identification if available
-        participant_user_id = participant.get("info", {}).get("userId")
-        participant_display_name = participant_user_id if participant_user_id else participant.get(
-            'user_name', 'Unknown')
-
-        logger.info(
-            f"Participant '{participant_display_name}' (ID: {participant_id}) left. Reason: {reason}")
-
-        consumer_participant_id = flow_manager.state.get(
-            "consumer_participant_id")
-        # Check if the leaving participant is the consumer
-        consumer_left_this_event = (
-            participant_id == consumer_participant_id)
-        # Check the transfer initiation state (using the key "initate_transfer" as seen in other logs)
-        is_initiating_transfer = flow_manager.state.get(
-            "initate_transfer", False)
-
-        dialback_consumer = flow_manager.state.get(
-            "dialback_consumer", False)
-        second_transfer_attempt = flow_manager.state.get(
-            "second_transfer_attempt", False)
-
-        if consumer_left_this_event:
-            logger.info(
-                "Consumer has left the call (on_participant_left).")
-            flow_manager.state["consumer_hung_up"] = True
-
-            current_node = flow_manager.state.get("current_node_name", "")
-
-            if current_node.startswith("page_35_"):
-                logger.info(
-                    "Consumer left call while Page 35 is active. Page 35 will manage call termination.")
-                # Page 35 has ActionConfig(type="end_conversation")
-            elif current_node == "page_6_specialist_intro_node":
-                logger.info(
-                    "Consumer left call while Page 6 is active. Page 6/24 will manage call.")
-                # Page 6 logic will see consumer_hung_up state and transition to Page 24.
-            elif is_initiating_transfer:
-                logger.info(
-                    "Consumer left call while a partner transfer was being initiated. "
-                    "Bot will remain active. Partner dialout handlers or Page 6 will use 'consumer_hung_up' state.")
-                # DO NOT CANCEL TASK HERE. Let partner connection logic or Page 6 handle it.
-            else:
-                logger.info(
-                    "Consumer left call. No specific page handling or active transfer. Cancelling task.")
-                if human_conversation_pipeline_task:  # MODIFIED
-                    await voicemail_detection_pipeline_task.queue_frame(EndFrame())
-                    await human_conversation_pipeline_task.queue_frame(EndFrame())
-                    await human_conversation_pipeline_task.cancel()
-                return  # Exit if task is cancelled to avoid further checks
-
-            # Check if all human participants (those with userId 'consumer' or 'partner') have left the Daily room.
-        current_room_participants = transport.participants()
-        # Should ideally not happen if bot is still running, but good check.
-        if not current_room_participants:
-            logger.info(
-                "No participants found via transport.participants(). Assuming all left. Cancelling task.")
-            if human_conversation_pipeline_task:  # MODIFIED
-                await voicemail_detection_pipeline_task.queue_frame(EndFrame())
-                await human_conversation_pipeline_task.queue_frame(EndFrame())
-                await human_conversation_pipeline_task.cancel()
-            return
-
-        human_user_ids_in_room = {
-            p_data.get("info", {}).get("userId")
-            for p_data in current_room_participants.values()
-            if p_data.get("info", {}).get("userId") in {"consumer", "partner"}
-        }
-
-        if not human_user_ids_in_room:
-            # If the consumer is the one who just left AND a transfer is in progress,
-            # don't cancel here. We are waiting for the partner who might not be in the Daily room yet.
-            if consumer_left_this_event and is_initiating_transfer:
-                logger.info(
-                    "All human userIDs ('consumer'/'partner') are absent from Daily room, "
-                    "but consumer left during transfer initiation. Waiting for partner dialout outcome.")
-
-                # If we are are haning up on the partner, and we plan to dialback consumer on failed transfer
-                # but not if this is the second failed transfer attempt
-            elif not consumer_left_this_event and dialback_consumer and not second_transfer_attempt:
-                logger.info(
-                    "All human userIDs ('consumer'/'partner') are absent from Daily room, "
-                    "but consumer left during transfer. Will attempt reconnecting with consumer.")
-
-            else:
-                logger.info(
-                    "All human userIDs ('consumer'/'partner') appear to have left the Daily room. Cancelling pipeline task.")
-                if human_conversation_pipeline_task:  # MODIFIED
-                    await voicemail_detection_pipeline_task.queue_frame(EndFrame())
-                    await human_conversation_pipeline_task.queue_frame(EndFrame())
-                    await human_conversation_pipeline_task.cancel()
-        else:
-            remaining_ids = list(human_user_ids_in_room)
-            logger.info(
-                f"Human participants (userId 'consumer' or 'partner') still in Daily room: {remaining_ids}. Bot will continue.")
-
-    @transport.event_handler("on_participant_joined")
-    async def on_participant_joined(transport, participant):
-        """Handle participant joining during human conversation phase."""
-        try:
-            logger.info(f"Participant joined: {participant}")
-            callLeg = participant.get("info", {}).get("userId")
-            dialback_consumer = flow_manager.state.get(
-                "dialback_consumer", False)
-            initate_transfer = flow_manager.state.get(
-                "initate_transfer", False)
-
-            participant_id = participant["id"]
-
-            # Store using both the dynamic key and standardized keys for compatibility
-            flow_manager.state[f"{callLeg}_participant_id"] = participant_id
-
-            logger.critical(
-                f"Participant '{callLeg}' joined with ID: {participant_id}")
-            if callLeg == "consumer":
-                if dialback_consumer:
-                    from script_pages.consumer_dial_back import create_consumer_dialback_greeting_node
-                    logger.info(
-                        "Consumer joined after dialback. Transitioning to consumer dialback greeting node.")
-
-                    # Set the consumer dialback greeting node
-                    await flow_manager.set_node("consumer_dialback_greeting_node", create_consumer_dialback_greeting_node(
-                        flow_manager))
-
-                else:
-                    # Standard consumer flow (first call) - this will be handled by on_dialout_answered
-                    logger.info(
-                        "Consumer joined for initial call - will be handled by on_dialout_answered")
-
-            elif callLeg == "partner":
-                logger.debug("Partner joined - setting consumer state")
-                flow_manager.state["partner_participant_id"] = participant_id
-
-                customer_participant_id = flow_manager.state.get(
-                    'consumer_participant_id')
-                if customer_participant_id:
-                    await transport.update_remote_participants(
-                        remote_participants={
-                            customer_participant_id: {
-                                "permissions": {
-                                    "canReceive": {
-                                        "base": False,
-                                        "byUserId": {"hold-music": True, "partner": False},
-                                    }
-                                },
-                            }
-                        }
-                    )
-
-        except Exception as e:
-            logger.error(f"Error handling participant join: {e}")
-            logger.exception("Full traceback:")
-    # Initialize flows when human conversation starts
-    flow_initialized = False
-
-    async def initialize_human_conversation_flow():
-        nonlocal flow_initialized
-        if not flow_initialized:
-            # Initialize flow manager first
-            await flow_manager.initialize()
-            # Then set the initial node
-
-            # await flow_manager.set_node("greeting", create_greeting_node())
-            await flow_manager.set_node("greeting", create_page_5_entry_node(flow_manager))
-
-            flow_initialized = True
-
-    # ------------ RUN HUMAN CONVERSATION PIPELINE WITH FLOWS ------------
-
-    try:
-        # Initialize the flow first
-        await initialize_human_conversation_flow()
-
-        # Run the human conversation pipeline with flows
-        await runner.run(human_conversation_pipeline_task)
-    except Exception as e:
-        logger.error(f"Error in human conversation pipeline: {e}")
-        import traceback
-
-        logger.error(traceback.format_exc())
-
-    print("!!! Done with human conversation pipeline")
-
-
-# ------------ SCRIPT ENTRY POINT ------------
-
-
-async def main():
-
-    # Default direct mode - create room and run bot
-    logger.info(
-        "Running in direct mode - creating room and calling phone number")
-
-    if not daily_api_key:
-        logger.error("DAILY_API_KEY environment variable is required")
-        sys.exit(1)
-
-    if not google_api_key:
-        logger.error("GOOGLE_API_KEY environment variable is required")
-        sys.exit(1)
-
-    # Determine phone number: command line arg takes precedence over env var
-    phone_number = to_phone_number
-    if not phone_number:
-        logger.error(
-            "Phone number is required. Set TO_PHONE_NUMBER environment variable or use -p argument")
-        sys.exit(1)
-
-    try:
-        # Create room and tokens
-        room_url, bot_token, music_token = await create_room_and_tokens(daily_api_key, daily_api_url)
-
-        # Create body configuration for dial-out
-        dialout_settings = {
-            "phone_number": phone_number
-        }
-
-        body_config = {
-            "dialout_settings": dialout_settings
-        }
-
-        body_json = json.dumps(body_config)
-
-        logger.info(f"Created room: {room_url}")
-        logger.info(f"Created music token: {music_token[:10]}...")
-        logger.info(f"Calling phone number: {phone_number}")
-
-        # Run the bot
-        await run_bot(room_url, bot_token, body_json, music_token)
-
-    except Exception as e:
-        logger.error(f"Failed to create room and run bot: {e}")
-        sys.exit(1)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run_local_test())
