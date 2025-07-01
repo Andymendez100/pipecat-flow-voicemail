@@ -80,11 +80,45 @@ HUMAN_CONFIDENCE_THRESHOLD = 0.6
 
 
 # Type definitions for flows
+class GreetingResult(FlowResult):
+    greeting_complete: bool
+
+
+class ConversationResult(FlowResult):
+    message: str
+
+
 class EndConversationResult(FlowResult):
     status: str
 
 
 # Flow function handlers
+async def handle_greeting(args: FlowArgs, flow_manager: FlowManager) -> tuple[GreetingResult, str]:
+    """Handle initial greeting to human."""
+    logger.debug("handle_greeting executing")
+
+    result = GreetingResult(greeting_complete=True)
+
+    # Get lead first name from flow manager state
+    lead_first_name = flow_manager.state.get("lead_first_name")
+
+    # Set up the conversation node dynamically with lead first name
+    await flow_manager.set_node("conversation", create_conversation_node(lead_first_name))
+
+    return result, "conversation"
+
+
+async def handle_conversation(
+    args: FlowArgs, flow_manager: FlowManager
+) -> tuple[ConversationResult, str]:
+    """Handle ongoing conversation with human."""
+    message = args.get("message", "")
+    logger.debug(f"handle_conversation executing with message: {message}")
+
+    result = ConversationResult(message=message)
+
+    # Continue with the same conversation node for ongoing chat
+    return result, "conversation"
 
 
 async def handle_end_conversation(
@@ -102,15 +136,51 @@ async def handle_end_conversation(
 
 
 # Node configurations for human conversation flow
-def create_greeting_node(lead_first_name: str = "the lead") -> NodeConfig:
+def create_greeting_node() -> NodeConfig:
     """Create the initial greeting node for human conversation."""
     return {
         "name": "greeting",
+        "role_messages": [
+            {
+                "role": "system",
+                "content": (
+                    """You are a friendly chatbot. Your responses will be
+                    converted to audio, so avoid special characters.
+                    Be conversational and helpful."""
+                ),
+            }
+        ],
         "task_messages": [
             {
                 "role": "system",
                 "content": (
-                    "You are a professional customer support agent for educational services. Your responses will be converted to audio, so keep them natural and conversational without special characters or emojis. "
+                    "The user has been detected as a human (not a voicemail system). "
+                    "Respond naturally to what they say. then introduce yourself as virtual Agent Kim. "
+                    "After responding to their input, call handle_greeting to proceed to the main conversation."
+                ),
+            }
+        ],
+        "functions": [
+            FlowsFunctionSchema(
+                name="handle_greeting",
+                description="Mark that greeting is complete and proceed to conversation",
+                properties={},
+                required=[],
+                handler=handle_greeting,
+            )
+        ],
+    }
+
+
+def create_conversation_node(lead_first_name: str = "the lead") -> NodeConfig:
+    """Create the main conversation node."""
+    return {
+        "name": "conversation",
+        "task_messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a professional customer support agent for Penn and Fosters educational services. Your responses will be converted to audio, so keep them natural and conversational without special characters or emojis. "
 
                     "COMPLETE CONVERSATION SCRIPT - Follow this exact sequence to minimize function calls: "
 
@@ -133,11 +203,11 @@ def create_greeting_node(lead_first_name: str = "the lead") -> NodeConfig:
                     f"Say: 'I'm looking for {lead_first_name}. Are you {lead_first_name} or are you their parent or guardian?' Wait for clarification, then follow the appropriate option above. "
 
                     "STEP 3 - MAIN SCRIPT (Only proceed here after identity is verified in Step 2): "
-                    "Say: 'Hi, this is Kim, a virtual agent and this call may be monitored or recorded for quality purposes. I'm calling to follow up - have you already completed the online enrollment process with us?' "
+                    "Say: 'Hi, this is Kim with Penn Foster and this call may be monitored or recorded for quality purposes. I'm calling to follow up - have you already completed the online enrollment process with us?' "
 
                     "STEP 4 - RESPOND based on their enrollment status: "
 
-                    "IF ALREADY ENROLLED: Say 'Congratulations and welcome! Our Student Services team will be reaching out shortly to help you get started with your studies. Thank you and have a great day!' Then call handle_end_conversation. "
+                    "IF ALREADY ENROLLED: Say 'Congratulations and welcome to Penn Foster! Our Student Services team will be reaching out shortly to help you get started with your studies. Thank you and have a great day!' Then call handle_end_conversation. "
 
                     "IF NOT ENROLLED YET: Say 'I'd like to connect you with one of our enrollment specialists who can provide more information and help with the enrollment process. Please hold while I transfer you.' Then call handle_end_conversation. "
 
@@ -145,7 +215,7 @@ def create_greeting_node(lead_first_name: str = "the lead") -> NodeConfig:
 
                     "IF WANTS TO OPT-OUT: Say 'I completely understand and I'll make sure to update our records immediately so you won't receive any more calls from us. Thank you and I apologize for any inconvenience.' Then call handle_end_conversation. "
 
-                    "IF UNCLEAR/DOESN'T UNDERSTAND: Say 'I apologize for the confusion. This was regarding educational opportunities, but I'll make note of this in our system. Have a great day.' Then call handle_end_conversation. "
+                    "IF UNCLEAR/DOESN'T UNDERSTAND: Say 'I apologize for the confusion. This was regarding educational opportunities with Penn Foster, but I'll make note of this in our system. Have a great day.' Then call handle_end_conversation. "
 
                     "CRITICAL RULE: Do NOT proceed to the main script (Step 3) unless you have confirmed you are speaking with either the lead directly OR their parent/guardian. Identity verification must be completed first before discussing enrollment."
                 ),
@@ -338,11 +408,6 @@ async def run_bot(room_url: str, token: str, body: dict) -> None:
     # caller_id = body_data["from_phone_number"]
     caller_id = ""
 
-    # Extract lead information for use in voicemail messages
-    script_info = body_data.get("scriptInfo", {})
-    lead_first_name = script_info.get("lead_first_name", "there")
-    pf_program = script_info.get("pf_program", "our programs")
-
     # Simple state tracking
     current_mode = MUTE_MODE
     is_voicemail = False
@@ -356,7 +421,7 @@ async def run_bot(room_url: str, token: str, body: dict) -> None:
     # ------------ FUNCTION HANDLERS ------------
 
     async def voicemail_detected(params: FunctionCallParams):
-        nonlocal current_mode, is_voicemail, lead_first_name, pf_program
+        nonlocal current_mode, is_voicemail
 
         confidence = params.arguments["confidence"]
         reasoning = params.arguments["reasoning"]
@@ -370,11 +435,14 @@ async def run_bot(room_url: str, token: str, body: dict) -> None:
 
             await voicemail_observer.wait_for_voicemail()
 
-            # Use lead information directly from parsed body data
-            agent_name = "Kim"
+            # Get lead information from flow manager state
+            lead_first_name = flow_manager.state.get(
+                "lead_first_name", "there")
+            agent_name = flow_manager.state.get("bot_name", "Kim")
+            pf_program = flow_manager.state.get("pf_program", "our programs")
 
-            # Generate  voicemail message
-            message = f"Hello {lead_first_name}, this is {agent_name}, a virtual agent calling to follow up on your request for information about our {pf_program} program. Please call us today at (855) 522-9232 for more info on this program. Thank you, and have a great day."
+            # Generate Penn Foster voicemail message
+            message = f"Hello {lead_first_name}, this is {agent_name} with Penn Foster calling to follow up on your request for information about our {pf_program} program. Please call us today at (855) 522-9232 for more info on this program. Thank you, and have a great day."
             await voicemail_tts.queue_frame(TTSSpeakFrame(text=message))
             await voicemail_tts.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
 
@@ -394,7 +462,7 @@ async def run_bot(room_url: str, token: str, body: dict) -> None:
             is_voicemail = False
 
             await human_notifier.notify()
-            await flow_manager.initialize()
+            await flow_manager.set_node("greeting", create_greeting_node())
 
         await params.result_callback({"confidence": f"{confidence}", "reasoning": reasoning})
 
@@ -606,6 +674,8 @@ async def run_bot(room_url: str, token: str, body: dict) -> None:
         transport=transport,
     )
 
+    script_info = body_data.get("scriptInfo", {})
+
     # Initialize flow manager state with all necessary data
     flow_manager.state.update({
         "bot_name": "Kim",
@@ -620,10 +690,12 @@ async def run_bot(room_url: str, token: str, body: dict) -> None:
         "program_id": body_data.get("program_id"),
         "event_log_id": body_data.get("event_log_id"),
         # Script Info
-        "lead_first_name": lead_first_name,
+        "lead_first_name": script_info.get("lead_first_name"),
         "lead_state": script_info.get("lead_state"),
-        "pf_program": pf_program,
+        "pf_program": script_info.get("pf_program"),
     })
+
+    await flow_manager.initialize()
 
     # ------------ EVENT HANDLERS ------------
 
