@@ -11,7 +11,6 @@ import os
 import sys
 import time
 
-import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat_flows import FlowArgs, FlowManager, FlowResult, FlowsFunctionSchema, NodeConfig
@@ -49,21 +48,16 @@ from pipecat.transports.services.daily import (
     DailyParams,
     DailyTransport,
 )
-from pipecatcloud import DailySessionArguments
-
 
 load_dotenv(override=True)
 
-logger.remove()
+logger.remove(0)
 logger.add(sys.stderr, level="DEBUG")
 
 daily_api_key = os.getenv("DAILY_API_KEY", "")
 daily_api_url = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
 
 use_prebuilt = False
-
-# aiohttp session will be created in async context
-
 
 # Simple constants for model states
 VOICEMAIL_MODE = "voicemail"
@@ -99,11 +93,8 @@ async def handle_greeting(args: FlowArgs, flow_manager: FlowManager) -> tuple[Gr
 
     result = GreetingResult(greeting_complete=True)
 
-    # Get lead first name from flow manager state
-    lead_first_name = flow_manager.state.get("lead_first_name")
-
-    # Set up the conversation node dynamically with lead first name
-    await flow_manager.set_node("conversation", create_conversation_node(lead_first_name))
+    # Set up the conversation node dynamically
+    await flow_manager.set_node("conversation", create_conversation_node())
 
     return result, "conversation"
 
@@ -367,6 +358,7 @@ class UserAudioCollector(FrameProcessor):
 
         await self.push_frame(frame, direction)
 
+
 # ------------ MAIN FUNCTION ------------
 
 
@@ -376,12 +368,11 @@ async def run_bot(room_url: str, token: str, body: dict) -> None:
     # ------------ SETUP ------------
     logger.info(f"Starting bot with room: {room_url}")
 
-    # Create aiohttp session for API calls
-    aiohttp_session = aiohttp.ClientSession()
-
     body_data = json.loads(body)
-    phone_number = body_data["to_phone_number"]
-    # caller_id = body_data["from_phone_number"]
+    # dialout_settings = body_data["dialout_settings"]
+    # phone_number = dialout_settings["phone_number"]
+    phone_number = "+19519887911"
+    # caller_id = dialout_settings.get("caller_id")
     caller_id = ""
 
     # Simple state tracking
@@ -411,14 +402,8 @@ async def run_bot(room_url: str, token: str, body: dict) -> None:
 
             await voicemail_observer.wait_for_voicemail()
 
-            # Get lead information from flow manager state
-            lead_first_name = flow_manager.state.get(
-                "lead_first_name", "there")
-            agent_name = flow_manager.state.get("bot_name", "Kim")
-            pf_program = flow_manager.state.get("pf_program", "our programs")
-
-            # Generate Penn Foster voicemail message
-            message = f"Hello {lead_first_name}, this is {agent_name} with Penn Foster calling to follow up on your request for information about our {pf_program} program. Please call us today at (855) 522-9232 for more info on this program. Thank you, and have a great day."
+            # Generate voicemail message
+            message = "Hello, this is a message for Pipecat example user. This is Chatbot. Please call back on 123-456-7891. Thank you."
             await voicemail_tts.queue_frame(TTSSpeakFrame(text=message))
             await voicemail_tts.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
 
@@ -439,7 +424,6 @@ async def run_bot(room_url: str, token: str, body: dict) -> None:
 
             await human_notifier.notify()
             await flow_manager.initialize()
-            # await flow_manager.set_node("greeting", create_greeting_node())
 
         await params.result_callback({"confidence": f"{confidence}", "reasoning": reasoning})
 
@@ -456,8 +440,8 @@ async def run_bot(room_url: str, token: str, body: dict) -> None:
         token,
         "Voicemail Detection Bot",
         DailyParams(
-            # api_url=daily_api_url,
-            # api_key=daily_api_key,
+            api_url=daily_api_url,
+            api_key=daily_api_key,
             audio_in_enabled=True,
             audio_out_enabled=True,
             video_out_enabled=False,
@@ -560,7 +544,7 @@ async def run_bot(room_url: str, token: str, body: dict) -> None:
     )
 
     human_llm = GoogleLLMService(
-        model="models/gemini-2.5-flash",
+        model="models/gemini-2.0-flash-001",
         api_key=os.getenv("GOOGLE_API_KEY"),
         # system_instruction="""You are Chatbot talking to a human. Be friendly and helpful.
         # Start with: "Hello! I'm a friendly chatbot. How can I help you today?"
@@ -651,29 +635,6 @@ async def run_bot(room_url: str, token: str, body: dict) -> None:
         transport=transport,
     )
 
-    script_info = body_data.get("scriptInfo", {})
-
-    # Initialize flow manager state with all necessary data
-    flow_manager.state.update({
-        "bot_name": "Kim",
-        "escalation_number": body_data.get("escalation_number"),
-        "partner_phone_number": body_data.get("partner_phone_number"),
-        "session_id": body_data.get("session_id"),
-        "from_phone_number": body_data.get("from_phone_number"),
-        "to_phone_number": phone_number,
-        "daily_room_url": body_data.get("daily_room_url"),
-        "music_token": body_data.get("music_token"),
-        "lead_id": body_data.get("lead_id"),
-        "program_id": body_data.get("program_id"),
-        "event_log_id": body_data.get("event_log_id"),
-        # Script Info
-        "lead_first_name": script_info.get("lead_first_name"),
-        "lead_state": script_info.get("lead_state"),
-        "pf_program": script_info.get("pf_program"),
-    })
-
-    # await flow_manager.initialize()
-
     # ------------ EVENT HANDLERS ------------
 
     @transport.event_handler("on_joined")
@@ -683,7 +644,7 @@ async def run_bot(room_url: str, token: str, body: dict) -> None:
             if caller_id:
                 dialout_params["callerId"] = caller_id
             logger.info(
-                f"Dialing out to {phone_number} with caller ID {caller_id}")
+                f"Dialing out to {phone_number} with params: {dialout_params}")
             await transport.start_dialout(dialout_params)
 
     @transport.event_handler("on_dialout_answered")
@@ -715,148 +676,26 @@ async def run_bot(room_url: str, token: str, body: dict) -> None:
         import traceback
 
         logger.error(traceback.format_exc())
-    finally:
-        await aiohttp_session.close()
 
 
 # ------------ ENTRY POINT ------------
 
-async def bot(args: DailySessionArguments) -> None:
-    """Main Entry point for Pipecat Cloud Bot"""
-    args_body = args.body
-    await run_bot(args_body["daily_room_url"],
-                  args_body["bot_token"], json.dumps(args_body))
-    # session_id
-    # daily_room_url
-    # event_log_id
-    # lead_id
-    # program_id
-    # bot_token
-    # music_token
-    # from_phone_number
-    # to_phone_number
-    # scriptInfo {}
-    # escalation_number
-    # partner_phone_number
 
+async def main():
+    parser = argparse.ArgumentParser(
+        description="Simplified Parallel Pipeline Bot")
+    parser.add_argument("-u", "--url", type=str, help="Room URL")
+    parser.add_argument("-t", "--token", type=str, help="Room Token")
+    parser.add_argument("-b", "--body", type=str, help="JSON config")
 
-async def create_room_and_tokens(api_key: str) -> tuple[str, str, str]:
-    """Create a Daily room and generate bot and music tokens.
+    args = parser.parse_args()
+    if not all([args.url, args.token, args.body]):
+        logger.error("All arguments required")
+        parser.print_help()
+        sys.exit(1)
 
-    Args:
-        api_key: Daily API key
-
-    Returns:
-        Tuple of (room_url, bot_token, music_token)
-    """
-    if not api_key:
-        raise ValueError("Daily API key is required")
-
-    api_url = "https://api.daily.co/v1"
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-
-    async with aiohttp.ClientSession() as session:
-        # Create room
-        room_config = {
-            "properties": {
-                "enable_shared_chat_history": False,
-                "max_participants": 3,
-                "geo": 'us-west-2',
-                "enable_dialout": True,
-                "dialout_config": {
-                    "allow_room_start": True,
-                    "dialout_geo": "us-west-2",
-                },
-                "exp": int(time.time()) + (30 * 60)  # 30 minutes
-            }
-        }
-
-        async with session.post(f"{api_url}/rooms", headers=headers, json=room_config) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                raise Exception(
-                    f"Failed to create room: {response.status} - {error_text}")
-
-            room_data = await response.json()
-            room_url = room_data["url"]
-            logger.info(f"Created room: {room_url}")
-
-        # Create bot token
-        bot_token_config = {
-            "properties": {
-                "room_name": room_data["name"],
-                "user_name": "bot",
-                "user_id": "bot",
-                "is_owner": True,
-            }
-        }
-
-        async with session.post(f"{api_url}/meeting-tokens", headers=headers, json=bot_token_config) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                raise Exception(
-                    f"Failed to create bot token: {response.status} - {error_text}")
-
-            bot_token_data = await response.json()
-            bot_token = bot_token_data["token"]
-            logger.info("Created bot token")
-
-        # Create music token
-        music_token_config = {
-            "properties": {
-                "room_name": room_data["name"],
-                "user_name": "hold-music",
-                "user_id": "hold-music",
-            }
-        }
-
-        async with session.post(f"{api_url}/meeting-tokens", headers=headers, json=music_token_config) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                raise Exception(
-                    f"Failed to create music token: {response.status} - {error_text}")
-
-            music_token_data = await response.json()
-            music_token = music_token_data["token"]
-            logger.info("Created music token")
-
-    return room_url, bot_token, music_token
-
-
-async def run_local_test() -> None:
-    """Run a local test of the bot."""
-    # Create a room
-    room_url, bot_token, music_token = await create_room_and_tokens(daily_api_key)
-    # Create a test body
-    mock_body = {
-        "daily_room_url": room_url,
-        "bot_token": bot_token,
-        "music_token": music_token,
-        "session_id": "test-session",
-        "event_log_id": 1234,
-        "lead_id": 12345,
-        "program_id": 67890,
-        "from_phone_number": os.getenv("FROM_PHONE_NUMBER"),
-        "to_phone_number": os.getenv("TO_PHONE_NUMBER"),
-        "scriptInfo": {
-            "lead_first_name": "John",
-            "lead_state": "California",
-            "pf_program": "High School",
-        },
-        "escalation_number": os.getenv("ESCALATION_NUMBER"),
-        "partner_phone_number": os.getenv("PARTNER_PHONE_NUMBER"),
-    }
-
-    await run_bot(
-        room_url=room_url,
-        token=bot_token,
-        body=json.dumps(mock_body)
-    )
+    await run_bot(args.url, args.token, args.body)
 
 
 if __name__ == "__main__":
-    asyncio.run(run_local_test())
+    asyncio.run(main())

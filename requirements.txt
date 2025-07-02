@@ -1,4 +1,5 @@
 python-dotenv
-pipecat-ai[cartesia,daily,openai,silero,google]
-pipecat-ai-flows
+pipecat-ai[cartesia,daily,openai,silero,google,deepgram] == 0.0.71
+pipecat-ai-flows 
 aiohttp
+pipecatcloud
