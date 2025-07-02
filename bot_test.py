@@ -147,7 +147,7 @@ def create_greeting_node() -> NodeConfig:
                 "content": (
                     "The user has been detected as a human (not a voicemail system). "
                     "Respond naturally to what they say. Listen to their input and respond appropriately. "
-                    "If they seem to be greeting you or asking if someone is there, greet them warmly. "
+                    "You need to verify that we are speaking to Jacob, If not ask them to put jacob on the line. "
                     "After responding to their input, call handle_greeting to proceed to the main conversation."
                 ),
             }
